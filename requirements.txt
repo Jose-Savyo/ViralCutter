@@ -15,3 +15,5 @@ fastapi
 uvicorn
 deep-translator
 tqdm
+anthropic
+requests

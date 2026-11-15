@@ -30,8 +30,11 @@ The transcript below is a continuous text stream with embedded **Time Tags** lik
     -   Use the `(XXs)` tags to estimate duration.
     -   CONSTRAINT: Segment MUST be between {min_duration}s and {max_duration}s.
 
+### VIDEO CONTEXT:
+{video_type_instruction}
+
 ### YOUR TASK:
-Analyze the transcript below. Find {amount} potential viral segments.
+{context_instruction}Analyze the transcript below and {virality_instruction}. Find {amount} potential viral segments.
 
 TRANSCRIPT:
 {transcript_chunk}

@@ -33,6 +33,17 @@ try:
 except ImportError:
     HAS_LLAMA_CPP = False
 
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+# Modelos/URLs padrao dos provedores adicionais
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5-5"
+
 def clean_json_response(response_text):
     """
     Limpa a resposta focando em encontrar o objeto JSON que contém a chave "segments".
@@ -281,6 +292,102 @@ def call_g4f(prompt, model_name=None):
     print(f"Falha crítica após {max_retries} tentativas no G4F.")
     return "{}"
 
+def call_openai_compatible(prompt, api_key, model_name=None, base_url=None):
+    """
+    Qualquer API compativel com o endpoint /chat/completions da OpenAI:
+    OpenAI, OpenRouter, Groq, DeepSeek, Ollama (http://localhost:11434/v1), LM Studio, etc.
+    """
+    import requests
+
+    base_url = (base_url or DEFAULT_OPENAI_BASE_URL).rstrip("/")
+    model_name = model_name or DEFAULT_OPENAI_MODEL
+    url = f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:  # servidores locais (Ollama/LM Studio) nao exigem chave
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=600)
+        except requests.RequestException as e:
+            wait_time = 5 * (attempt + 1)
+            print(f"[WARN] Erro de conexão com {base_url} ({e}). Nova tentativa em {wait_time}s ({attempt+1}/{max_retries})...", flush=True)
+            time.sleep(wait_time)
+            continue
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            retry_after = resp.headers.get("retry-after")
+            try:
+                wait_time = float(retry_after) + 1.0 if retry_after else 15.0 * (attempt + 1)
+            except ValueError:
+                wait_time = 15.0 * (attempt + 1)
+            print(f"[{resp.status_code}] {base_url} ocupado/limite. Aguardando {wait_time:.0f}s ({attempt+1}/{max_retries})...", flush=True)
+            time.sleep(wait_time)
+            continue
+
+        if resp.status_code != 200:
+            print(f"Erro na API ({base_url}) HTTP {resp.status_code}: {resp.text[:500]}")
+            return "{}"
+
+        try:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"] or "{}"
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            print(f"Resposta inesperada de {base_url}: {e} | {resp.text[:300]}")
+            return "{}"
+
+    print(f"Falha após {max_retries} tentativas em {base_url}.")
+    return "{}"
+
+def call_anthropic(prompt, api_key, model_name=None):
+    """Claude via SDK oficial da Anthropic (pip install anthropic)."""
+    if not HAS_ANTHROPIC:
+        raise ImportError("A biblioteca 'anthropic' não está instalada. Instale com: pip install anthropic")
+
+    model_name = model_name or DEFAULT_ANTHROPIC_MODEL
+    # api_key=None -> o SDK usa ANTHROPIC_API_KEY / perfil do `ant auth login`
+    client = anthropic.Anthropic(api_key=api_key or None, max_retries=5)
+
+    try:
+        # fallbacks="default": se o modelo recusar por politica de seguranca, a propria API
+        # tenta de novo em um modelo alternativo dentro da mesma chamada.
+        response = client.beta.messages.create(
+            model=model_name,
+            max_tokens=16000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            output_config={"effort": "medium"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.AuthenticationError:
+        print("Erro na API da Anthropic: chave inválida.")
+        return "{}"
+    except anthropic.NotFoundError as e:
+        print(f"Erro na API da Anthropic: modelo '{model_name}' não encontrado ({e.message}).")
+        return "{}"
+    except anthropic.RateLimitError:
+        print("Erro na API da Anthropic: limite de uso atingido (429) mesmo após as tentativas.")
+        return "{}"
+    except anthropic.APIStatusError as e:
+        print(f"Erro na API da Anthropic (HTTP {e.status_code}): {e.message}")
+        return "{}"
+    except anthropic.APIConnectionError as e:
+        print(f"Erro de conexão com a API da Anthropic: {e}")
+        return "{}"
+
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        category = getattr(details, "category", None) if details else None
+        print(f"A Anthropic recusou o pedido (categoria: {category}).")
+        return "{}"
+    if response.stop_reason == "max_tokens":
+        print("[WARN] Resposta da Anthropic cortada em max_tokens; tentando aproveitar o JSON parcial.")
+
+    text = "".join(block.text for block in response.content if block.type == "text")
+    return text or "{}"
+
 def load_transcript(project_folder):
     """Parses input.tsv or input.srt from the project folder."""
     input_tsv = os.path.join(project_folder, 'input.tsv')
@@ -329,6 +436,35 @@ def load_transcript(project_folder):
         raise ValueError("Could not parse transcript from TSV or SRT.")
     
     return transcript_segments
+
+SENTENCE_END_RE = re.compile(r'[.!?…]["\'”»)\]]*$')
+
+def snap_end(start, desired_end, transcript_segments, min_duration, max_duration):
+    """
+    Escolhe o fim do corte em um limite de fala da transcricao, dentro de
+    [start + min_duration, start + max_duration], preferindo fins de frase (. ? !).
+    Retorna (end, motivo): "ok" (fim pedido ja estava dentro dos limites),
+    "antes-do-max", "depois-do-min", "sem-candidatos".
+    """
+    lo, hi = start + min_duration, start + max_duration
+    if desired_end is not None and lo <= desired_end <= hi:
+        return desired_end, "ok"
+
+    eps = 0.05
+    candidates = [s for s in transcript_segments if lo - eps <= s['end'] <= hi + eps]
+    if not candidates:
+        # Nenhum limite de fala dentro da janela (falas muito longas): mantem o comportamento antigo
+        if desired_end is None:
+            return lo, "sem-candidatos"
+        return min(max(desired_end, lo), hi), "sem-candidatos"
+
+    sentence_ends = [s for s in candidates if SENTENCE_END_RE.search(s['text'].strip())]
+    pool = sentence_ends or candidates
+    if desired_end is not None and desired_end > hi:
+        # Longo demais: ultimo fim de frase antes do maximo
+        return max(s['end'] for s in pool), "antes-do-max"
+    # Curto demais ou fim nao encontrado: primeiro fim de frase depois do minimo
+    return min(s['end'] for s in pool), "depois-do-min"
 
 def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None):
     """
@@ -423,24 +559,14 @@ def process_segments(raw_segments, transcript_segments, min_duration, max_durati
                          final_end_time = transcript_segments[i]['end']
                          break
             
-            # Fallback End Time
-            if final_end_time == -1:
-                 final_end_time = final_start_time + tempo_minimo 
-            
-            # Calculate Duration
+            # Ajusta o fim para um fim de frase da transcricao dentro de [min, max]
+            # (antes: "inicio + minimo" quando o end_text nao era achado, e corte seco no maximo)
+            desired_end = final_end_time if final_end_time != -1 else None
+            final_end_time, snap_reason = snap_end(final_start_time, desired_end, transcript_segments, tempo_minimo, tempo_maximo)
             duration = final_end_time - final_start_time
-            
-            # Validate Duration (Min)
-            if duration < tempo_minimo: 
-                print(f"[WARN] Segmento menor que duration min ({duration:.2f}s < {tempo_minimo}s). Estendendo para {tempo_minimo}s.")
-                duration = tempo_minimo
-                final_end_time = final_start_time + duration
-            
-            # Validate Duration (Max)
-            if duration > tempo_maximo:
-                print(f"[WARN] Segmento excede max duration ({duration:.2f}s > {tempo_maximo}s). Cortando para {tempo_maximo}s.")
-                final_end_time = final_start_time + tempo_maximo
-                duration = tempo_maximo
+            if snap_reason != "ok":
+                desired_txt = f"{desired_end - final_start_time:.1f}s" if desired_end is not None else "end_text não encontrado"
+                print(f"[INFO] Fim ajustado ({snap_reason}): {desired_txt} -> {duration:.1f}s")
 
             # Construct Final Segment
             processed_segments.append({
@@ -500,8 +626,47 @@ def process_segments(raw_segments, transcript_segments, min_duration, max_durati
     return final_result
 
 
-def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode="manual", api_key=None, project_folder="tmp", chunk_size_arg=None, model_name_arg=None):
+VIDEO_TYPES = ("generic", "podcast", "entrevista", "react", "vlog", "gameplay", "aula")
+
+# Instrucao extra enviada a IA conforme o tipo do video ({video_type_instruction} no prompt.txt)
+VIDEO_TYPE_INSTRUCTIONS = {
+    "generic": "VIDEO TYPE: General video (no specific format).",
+    "podcast": (
+        "VIDEO TYPE: Podcast / talk show conversation. Prefer segments where ONE complete idea, story, "
+        "opinion or argument is delivered from start to finish. Start where the speaker introduces the idea "
+        "(not mid-reply), end right after the conclusion or punchline. Avoid stretches dominated by crosstalk, "
+        "reading chat messages, sponsor reads or housekeeping."
+    ),
+    "entrevista": (
+        "VIDEO TYPE: Interview. Prefer a clear question followed by a complete, strong answer. The segment may "
+        "start with the interviewer's question if it gives context. End when the answer concludes."
+    ),
+    "react": (
+        "VIDEO TYPE: React video (a creator reacting to other content). Prefer moments of strong, genuine "
+        "reaction (surprise, laughter, disagreement, hot takes). Include enough of the content being reacted to "
+        "for a stranger to understand the reaction. Avoid long silent watching stretches."
+    ),
+    "vlog": (
+        "VIDEO TYPE: Vlog. Prefer moments with a clear mini-story or action, a strong visual or emotional start, "
+        "and a payoff. Skip transitions, greetings and logistics talk."
+    ),
+    "gameplay": (
+        "VIDEO TYPE: Gameplay / live stream. Prefer highlights: impressive plays, fails, funny moments, rage or "
+        "hype, unexpected events and strong commentary. The segment must make sense without the rest of the stream."
+    ),
+    "aula": (
+        "VIDEO TYPE: Class / lecture / tutorial. Prefer segments that explain ONE concept, tip or step completely "
+        "and are useful on their own. Start at the definition or question, end after the explanation or example. "
+        "Avoid segments that depend on slides or steps shown earlier."
+    ),
+}
+
+def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode="manual", api_key=None, project_folder="tmp", chunk_size_arg=None, model_name_arg=None, video_type="generic", base_url=None):
     quantidade_de_virals = num_segments
+    if video_type not in VIDEO_TYPE_INSTRUCTIONS:
+        print(f"[WARN] Tipo de vídeo desconhecido '{video_type}'. Usando 'generic'.")
+        video_type = "generic"
+    video_type_instruction = VIDEO_TYPE_INSTRUCTIONS[video_type]
 
     # 1. Load Transcript
     transcript_segments = load_transcript(project_folder)
@@ -524,6 +689,17 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
         },
         "g4f": {
             "chunk_size": 2000
+        },
+        "openai": {
+            "api_key": "",
+            "model": DEFAULT_OPENAI_MODEL,
+            "base_url": DEFAULT_OPENAI_BASE_URL,
+            "chunk_size": 15000
+        },
+        "anthropic": {
+            "api_key": "",
+            "model": DEFAULT_ANTHROPIC_MODEL,
+            "chunk_size": 15000
         }
     }
 
@@ -531,8 +707,9 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 loaded_config = json.load(f)
-                if "gemini" in loaded_config: config["gemini"].update(loaded_config["gemini"])
-                if "g4f" in loaded_config: config["g4f"].update(loaded_config["g4f"])
+                for section in ("gemini", "g4f", "openai", "anthropic"):
+                    if isinstance(loaded_config.get(section), dict):
+                        config[section].update(loaded_config[section])
                 if "selected_api" in loaded_config: config["selected_api"] = loaded_config["selected_api"]
         except Exception as e:
             print(f"Erro ao ler api_config.json: {e}")
@@ -554,6 +731,17 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
         cfg_model = config["g4f"].get("model")
         model_name = model_name_arg if model_name_arg else cfg_model
 
+    elif ai_mode in ("openai", "anthropic"):
+        section = config[ai_mode]
+        cfg_chunk = section.get("chunk_size", 15000)
+        current_chunk_size = chunk_size_arg if chunk_size_arg and int(chunk_size_arg) > 0 else cfg_chunk
+        model_name = model_name_arg if model_name_arg else section.get("model")
+        env_var = "OPENAI_API_KEY" if ai_mode == "openai" else "ANTHROPIC_API_KEY"
+        if not api_key:
+            api_key = section.get("api_key", "") or os.environ.get(env_var, "")
+        if ai_mode == "openai":
+            base_url = base_url or section.get("base_url") or DEFAULT_OPENAI_BASE_URL
+
     elif ai_mode == "local":
         current_chunk_size = chunk_size_arg if chunk_size_arg and int(chunk_size_arg) > 0 else 3000
         model_name = model_name_arg if model_name_arg else ""
@@ -566,6 +754,8 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
         print("Aviso: prompt.txt não encontrado. Usando prompt interno.")
         system_prompt_template = """You are a World-Class Viral Video Editor.
 {context_instruction}
+{video_type_instruction}
+Task: {virality_instruction}
 Analyze the transcript below with time tags (XXs). Find {amount} viral segments.
 Constraints: Each segment MUST be between {min_duration} seconds and {max_duration} seconds.
 IMPORTANT: Output "Title", "Hook", and "Reasoning" in the SAME LANGUAGE as the transcript (e.g., if transcript is Portuguese, output Portuguese).
@@ -618,10 +808,11 @@ OUTPUT JSON ONLY:
         else:
             start = next_start
 
-    if viral_mode:
-        virality_instruction = f"""analyze the segment for potential virality and identify {quantidade_de_virals} most viral segments from the transcript"""
+    if viral_mode or not (themes or "").strip():
+        virality_instruction = f"identify the {quantidade_de_virals} segments with the highest viral potential"
     else:
-        virality_instruction = f"""analyze the segment for potential virality and identify {quantidade_de_virals} the best parts based on the list of themes {themes}."""
+        virality_instruction = (f"identify the {quantidade_de_virals} best segments about these themes: {themes} "
+                                f"(only segments that are clearly about at least one of these themes)")
 
     output_texts = []
     for i, chunk in enumerate(chunks):
@@ -633,6 +824,7 @@ OUTPUT JSON ONLY:
             prompt = system_prompt_template.format(
                 context_instruction=context_instruction,
                 virality_instruction=virality_instruction,
+                video_type_instruction=video_type_instruction,
                 min_duration=tempo_minimo,
                 max_duration=tempo_maximo,
                 transcript_chunk=chunk,
@@ -643,6 +835,7 @@ OUTPUT JSON ONLY:
             prompt = system_prompt_template
             prompt = prompt.replace("{context_instruction}", context_instruction)
             prompt = prompt.replace("{virality_instruction}", virality_instruction)
+            prompt = prompt.replace("{video_type_instruction}", video_type_instruction)
             prompt = prompt.replace("{min_duration}", str(tempo_minimo))
             prompt = prompt.replace("{max_duration}", str(tempo_maximo))
             prompt = prompt.replace("{transcript_chunk}", chunk)
@@ -656,6 +849,7 @@ OUTPUT JSON ONLY:
         full_prompt = system_prompt_template
         full_prompt = full_prompt.replace("{context_instruction}", "Full Video Transcript Analysis")
         full_prompt = full_prompt.replace("{virality_instruction}", virality_instruction)
+        full_prompt = full_prompt.replace("{video_type_instruction}", video_type_instruction)
         full_prompt = full_prompt.replace("{min_duration}", str(tempo_minimo))
         full_prompt = full_prompt.replace("{max_duration}", str(tempo_maximo))
         full_prompt = full_prompt.replace("{transcript_chunk}", content) 
@@ -746,6 +940,12 @@ OUTPUT JSON ONLY:
         elif ai_mode == "g4f":
             print(f"Enviando chunk {i+1} para o G4F (Model: {model_name})...")
             response_text = call_g4f(prompt, model_name=model_name)
+        elif ai_mode == "openai":
+            print(f"Enviando chunk {i+1} para {base_url} (Model: {model_name})...")
+            response_text = call_openai_compatible(prompt, api_key, model_name=model_name, base_url=base_url)
+        elif ai_mode == "anthropic":
+            print(f"Enviando chunk {i+1} para a Anthropic (Model: {model_name})...")
+            response_text = call_anthropic(prompt, api_key, model_name=model_name)
         elif ai_mode == "local" and local_llm_instance:
             print(f"Processing chunk {i+1} with Local LLM...")
             try:

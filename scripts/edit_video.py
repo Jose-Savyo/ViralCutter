@@ -3,7 +3,7 @@ import numpy as np
 import os
 import subprocess
 import mediapipe as mp
-from scripts.one_face import crop_and_resize_single_face, resize_with_padding, detect_face_or_body, crop_center_zoom
+from scripts.one_face import crop_and_resize_single_face, resize_with_padding, detect_face_or_body, crop_center_zoom, compose_fit_blur, compose_fit_faces
 from scripts.two_face import crop_and_resize_two_faces, detect_face_or_body_two_faces
 try:
     from scripts.face_detection_insightface import init_insightface, detect_faces_insightface, crop_and_resize_insightface
@@ -16,36 +16,38 @@ except ImportError:
 # Global cache for encoder
 CACHED_ENCODER = None
 
+def _encoder_works(encoder_name, preset):
+    """Codifica alguns quadros de teste: o ffmpeg listar o encoder nao garante que exista o hardware."""
+    cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.2',
+           '-c:v', encoder_name, '-preset', preset, '-pix_fmt', 'yuv420p', '-f', 'null', '-']
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
 def get_best_encoder():
     global CACHED_ENCODER
     if CACHED_ENCODER: return CACHED_ENCODER
-    
+
     try:
         # Check available encoders
         result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True)
         output = result.stdout
-        
-        # Priority: NVENC (NVIDIA) > AMF (AMD) > QSV (Intel) > CPU
-        if "h264_nvenc" in output:
-            print("Encoder Detected: NVIDIA (h264_nvenc)")
-            CACHED_ENCODER = ("h264_nvenc", "fast") # p1-p7 presets could be used but 'fast' maps well
-            return CACHED_ENCODER
-        
-        if "h264_amf" in output:
-            print("Encoder Detected: AMD (h264_amf)")
-            CACHED_ENCODER = ("h264_amf", "speed") # quality, speed, balanced
-            return CACHED_ENCODER
-            
-        if "h264_qsv" in output:
-             print("Encoder Detected: Intel QSV (h264_qsv)")
-             CACHED_ENCODER = ("h264_qsv", "veryfast")
-             return CACHED_ENCODER
-             
-        # Mac OS (VideoToolbox)
-        if "h264_videotoolbox" in output:
-             print("Encoder Detected: MacOS (h264_videotoolbox)")
-             CACHED_ENCODER = ("h264_videotoolbox", "default")
-             return CACHED_ENCODER
+
+        # Priority: NVENC (NVIDIA) > AMF (AMD) > QSV (Intel) > VideoToolbox (Mac) > CPU
+        candidates = [
+            ("h264_nvenc", "fast", "NVIDIA"),
+            ("h264_amf", "speed", "AMD"),
+            ("h264_qsv", "veryfast", "Intel QSV"),
+            ("h264_videotoolbox", "default", "MacOS"),
+        ]
+        for name, preset, label in candidates:
+            if name in output:
+                if _encoder_works(name, preset):
+                    print(f"Encoder Detected: {label} ({name})")
+                    CACHED_ENCODER = (name, preset)
+                    return CACHED_ENCODER
+                print(f"Encoder {name} listed by ffmpeg but not usable on this machine. Skipping.")
 
     except Exception as e:
         print(f"Error checking encoders: {e}")
@@ -53,6 +55,36 @@ def get_best_encoder():
     print("Encoder Detected: CPU (libx264)")
     CACHED_ENCODER = ("libx264", "ultrafast")
     return CACHED_ENCODER
+
+FRAME_LAYOUTS = ("crop", "fit-blur", "fit-faces")
+
+# Correlacao de histograma abaixo deste valor entre quadros consecutivos = troca de cena/camera.
+# Calibrado num podcast de estudio: quadros seguidos ~1.0, fade ~0.88, corte seco entre cameras
+# do mesmo estudio (mesmas cores) ~0.72.
+SCENE_CUT_THRESHOLD = 0.80
+
+def frame_histogram(frame):
+    """Histograma HSV (H x S) normalizado de uma versao reduzida do quadro. Barato o bastante para todo quadro."""
+    small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
+def is_scene_cut(prev_hist, cur_hist, threshold=SCENE_CUT_THRESHOLD):
+    if prev_hist is None or cur_hist is None:
+        return False
+    return cv2.compareHist(prev_hist, cur_hist, cv2.HISTCMP_CORREL) < threshold
+
+def render_no_face(frame, frame_layout="crop", no_face_mode="padding"):
+    """Quadro sem rosto utilizavel, respeitando o layout escolhido."""
+    if frame_layout == "fit-blur":
+        return compose_fit_blur(frame)
+    if frame_layout == "fit-faces":
+        return compose_fit_faces(frame, [])
+    if no_face_mode == "zoom":
+        return crop_center_zoom(frame)
+    return resize_with_padding(frame)
 
 def get_center_bbox(bbox):
     # bbox: [x1, y1, x2, y2]
@@ -94,9 +126,9 @@ def sort_by_proximity(new_faces, old_faces, center_func):
     
     return new_faces
 
-def generate_short_fallback(input_file, output_file, index, project_folder, final_folder, no_face_mode="padding"):
-    """Fallback function: Center Crop (Zoom) or Padding if detection fails."""
-    print(f"Processing (Fallback): {input_file} | Mode: {no_face_mode}")
+def generate_short_fallback(input_file, output_file, index, project_folder, final_folder, no_face_mode="padding", frame_layout="crop"):
+    """Fallback function: Center Crop (Zoom) or Padding if detection fails. Also the fast path for frame_layout='fit-blur'."""
+    print(f"Processing (Fallback): {input_file} | Mode: {no_face_mode} | Layout: {frame_layout}")
     cap = cv2.VideoCapture(input_file)
     if not cap.isOpened():
         print(f"Error opening video: {input_file}")
@@ -138,12 +170,9 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
         ret, frame = cap.read()
         if not ret:
             break
-        
-        if no_face_mode == "zoom":
-             result = crop_center_zoom(frame)
-        else:
-             result = resize_with_padding(frame)
-        
+
+        result = render_no_face(frame, frame_layout, no_face_mode)
+
         try:
             # Write raw bytes to ffmpeg stdin
             process.stdin.write(result.tobytes())
@@ -467,16 +496,12 @@ def generate_short_haar(input_file, output_file, index, project_folder, final_fo
 
     cap.release()
     out.release()
-    
-    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
     finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
-    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
-
-def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding"):
+def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding", frame_layout="crop"):
     """Face detection using InsightFace (SOTA)."""
-    print(f"Processing (InsightFace): {input_file} | Mode: {face_mode}")
+    print(f"Processing (InsightFace): {input_file} | Mode: {face_mode} | Layout: {frame_layout}")
     
     cap = cv2.VideoCapture(input_file)
     if not cap.isOpened():
@@ -498,7 +523,11 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     last_detected_faces = None
     last_frame_face_positions = None
     last_success_frame = -1000
-    max_frames_without_detection = int(3.0 * fps) # 3 seconds timeout
+    # Segura a ultima posicao por no maximo 1s sem deteccao (antes 3s: mostrava o rosto
+    # errado por segundos depois de uma troca de camera). Troca de cena invalida na hora.
+    max_frames_without_detection = int(1.0 * fps)
+    prev_hist = None
+    scene_cut_count = 0
 
     transition_duration = 4 # Smooth transition over 4 frames (almost continuous)
     transition_frames = []
@@ -508,6 +537,11 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     current_num_faces_state = 1
     if face_mode == "2":
         current_num_faces_state = 2
+
+    # No fit-faces as faixas comportam 2 rostos sem dividir a tela: mostra o segundo
+    # rosto sempre que ele nao for muito menor que o principal.
+    if frame_layout == "fit-faces" and face_mode == "auto":
+        two_face_threshold = min(two_face_threshold, 0.30)
 
     frame_1_face_count = 0
     frame_2_face_count = 0
@@ -537,6 +571,21 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
 
         if not ret or frame is None:
             break
+
+        # --- SCENE CUT DETECTION ---
+        # Na troca de camera/cena: detecta de novo neste quadro e esquece o tracking anterior,
+        # sem interpolar entre a posicao antiga e a nova (evita "panoramica" falsa entre cameras).
+        cur_hist = frame_histogram(frame)
+        if is_scene_cut(prev_hist, cur_hist):
+            scene_cut_count += 1
+            print(f"DEBUG: Frame {frame_index} | Scene cut -> re-detecting faces")
+            next_detection_frame = frame_index
+            transition_frames = []
+            last_detected_faces = None
+            last_frame_face_positions = None
+            last_success_frame = -1000
+            faces_activity_state = []
+        prev_hist = cur_hist
 
         if frame_index >= next_detection_frame and len(transition_frames) == 0:
             # Detect faces
@@ -789,7 +838,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                      # --- Apply same filtering to lookahead ---
                      valid_faces2 = []
                      if faces2:
-                         faces2 = [f for f in faces2 if f.get('det_score', 0) > 0.50]
+                         faces2 = [f for f in faces2 if f.get('det_score', 0) > confidence_threshold]
                          if faces2:
                              for f in faces2:
                                  w = f['bbox'][2] - f['bbox'][0]
@@ -961,10 +1010,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             current_faces = last_detected_faces
         else:
             # Fallback for this frame
-            if no_face_mode == "zoom":
-                result = crop_center_zoom(frame)
-            else:
-                result = resize_with_padding(frame)
+            result = render_no_face(frame, frame_layout, no_face_mode)
             out.write(result)
             timeline_frames.append((frame_index, "1")) # Fix: Ensure fallback is treated as single face for subs
             
@@ -977,8 +1023,17 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         last_frame_face_positions = current_faces
         
         target_len = len(current_faces)
-        
-        if target_len == 2:
+
+        if frame_layout == "fit-faces":
+             # Video inteiro no centro + zoom nos rostos nas faixas de cima/baixo.
+             # Legenda na posicao padrao (modo "1"), logo abaixo do video central.
+             if target_len == 2:
+                 frame_2_face_count += 1
+             else:
+                 frame_1_face_count += 1
+             result = compose_fit_faces(frame, current_faces)
+             timeline_frames.append((frame_index, "1"))
+        elif target_len == 2:
              frame_2_face_count += 1
              # Convert [x1, y1, x2, y2] to (x, y, w, h)
              f1 = current_faces[0]
@@ -1076,15 +1131,23 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     except Exception as e:
         print(f"Error saving coords: {e}")
 
+    print(f"Summary: {scene_cut_count} scene cut(s) | 1-face frames: {frame_1_face_count} | 2-face frames: {frame_2_face_count} | total: {total_frames}")
     finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
-    
+
     # Return dominant mode logic (or keep 15% rule as overall fallback)
     if frame_2_face_count > (total_frames * 0.15):
         return "2"
     return "1"
 
 
-def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding"):
+def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop"):
+    if frame_layout not in FRAME_LAYOUTS:
+        print(f"WARNING: Unknown frame_layout '{frame_layout}'. Using 'crop'.")
+        frame_layout = "crop"
+    print(f"Frame layout: {frame_layout}")
+    # fit-blur nao usa rostos: nao precisa carregar detector nenhum
+    if frame_layout == "fit-blur":
+        face_model = "none"
     # Lazy init solutions only when needed to avoid AttributeError if import failed partially
     mp_face_detection = None
     mp_face_mesh = None
@@ -1176,8 +1239,14 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
             success = False
             detected_mode = "1" # Default if detection fails or fallback
 
+            # 0. Layout fit-blur: video inteiro + fundo desfocado, sem deteccao de rosto
+            if frame_layout == "fit-blur":
+                generate_short_fallback(input_file, output_file, index, project_folder, final_folder,
+                                        no_face_mode=no_face_mode, frame_layout="fit-blur")
+                success = True
+
             # 1. Try InsightFace
-            if insightface_working:
+            if insightface_working and not success:
                 try:
                     # Capture returned mode
                     res = generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode=face_mode, detection_period=detection_period, 
@@ -1186,8 +1255,10 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
                                                      active_speaker_motion_deadzone=active_speaker_motion_deadzone,
                                                      active_speaker_motion_sensitivity=active_speaker_motion_sensitivity,
                                                      active_speaker_decay=active_speaker_decay,
-                                                     no_face_mode=no_face_mode)
+                                                     no_face_mode=no_face_mode, frame_layout=frame_layout)
                     if res: detected_mode = res
+                    if frame_layout == "fit-faces":
+                        detected_mode = "1"  # legenda na posicao padrao
                     success = True
                 except Exception as e:
                     import traceback
@@ -1195,6 +1266,13 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
                     print(f"InsightFace processing failed for {input_filename}: {e}")
                     print("Falling back to MediaPipe/Haar...")
             
+            # 1b. fit-faces depende do InsightFace; sem ele, mantem o video inteiro com fundo desfocado
+            if not success and frame_layout == "fit-faces":
+                print("fit-faces requires InsightFace. Falling back to fit-blur for this segment.")
+                generate_short_fallback(input_file, output_file, index, project_folder, final_folder,
+                                        no_face_mode=no_face_mode, frame_layout="fit-blur")
+                success = True
+
             # 2. Try MediaPipe if InsightFace failed or not available
             if not success and mediapipe_working:
                 try:

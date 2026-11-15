@@ -137,3 +137,106 @@ def crop_center_zoom(frame):
     # Resize to final 1080x1920
     return cv2.resize(crop_img, (1080, 1920), interpolation=cv2.INTER_AREA)
 
+
+
+# ---------------------------------------------------------------------------
+# Layouts "video completo" (frame_layout = fit-blur / fit-faces)
+# O quadro original inteiro fica no centro do 9:16; as faixas livres em cima e
+# embaixo recebem um fundo desfocado (fit-blur) ou zoom nos rostos (fit-faces).
+# ---------------------------------------------------------------------------
+TARGET_W, TARGET_H = 1080, 1920
+
+
+def _center_crop_region(frame_w, frame_h, aspect):
+    """Maior retangulo centralizado com a proporcao `aspect` (w/h). Retorna (x, y, w, h)."""
+    if frame_w / frame_h > aspect:
+        h = frame_h
+        w = int(round(h * aspect))
+    else:
+        w = frame_w
+        h = int(round(w / aspect))
+    return (frame_w - w) // 2, (frame_h - h) // 2, w, h
+
+
+def blur_background(frame, width=TARGET_W, height=TARGET_H, darken=0.55):
+    """Fundo: zoom central do proprio quadro, desfocado e escurecido (feito em baixa resolucao)."""
+    fh, fw = frame.shape[:2]
+    x, y, w, h = _center_crop_region(fw, fh, width / height)
+    small = cv2.resize(frame[y:y + h, x:x + w], (max(1, width // 8), max(1, height // 8)),
+                       interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 4)
+    bg = cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+    return cv2.convertScaleAbs(bg, alpha=darken, beta=0)
+
+
+def fit_to_width(frame, width=TARGET_W):
+    """Redimensiona o quadro inteiro para `width` de largura (altura par)."""
+    fh, fw = frame.shape[:2]
+    h = int(round(width * fh / fw))
+    h -= h % 2
+    return cv2.resize(frame, (width, h), interpolation=cv2.INTER_AREA)
+
+
+def crop_band(frame, bbox, band_w, band_h, face_scale=2.6):
+    """
+    Recorta uma regiao com a proporcao da faixa (band_w x band_h) centrada no rosto
+    bbox = [x1, y1, x2, y2]. face_scale = altura do recorte / altura do rosto.
+    """
+    fh, fw = frame.shape[:2]
+    aspect = band_w / band_h
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    face_h = max(1.0, y2 - y1)
+    crop_h = max(face_h * face_scale, 48.0)
+    crop_w = crop_h * aspect
+    if crop_w > fw:
+        crop_w = float(fw)
+        crop_h = crop_w / aspect
+    if crop_h > fh:
+        crop_h = float(fh)
+        crop_w = crop_h * aspect
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2 + 0.15 * face_h  # desce um pouco para mostrar ombros
+    cx0 = int(round(min(max(cx - crop_w / 2, 0), fw - crop_w)))
+    cy0 = int(round(min(max(cy - crop_h / 2, 0), fh - crop_h)))
+    crop = frame[cy0:cy0 + int(crop_h), cx0:cx0 + int(crop_w)]
+    if crop.size == 0:
+        return blur_background(frame, band_w, band_h)
+    return cv2.resize(crop, (band_w, band_h), interpolation=cv2.INTER_LINEAR)
+
+
+def compose_fit_blur(frame):
+    """Video inteiro no centro, fundo desfocado atras."""
+    fg = fit_to_width(frame)
+    if fg.shape[0] >= TARGET_H:  # fonte ja vertical: nada a encaixar
+        return crop_center_zoom(frame)
+    canvas = blur_background(frame)
+    y = (TARGET_H - fg.shape[0]) // 2
+    canvas[y:y + fg.shape[0]] = fg
+    return canvas
+
+
+def compose_fit_faces(frame, faces):
+    """
+    Video inteiro no centro; faixa de cima = zoom no rosto 1, faixa de baixo = zoom no rosto 2.
+    faces: lista de bboxes [x1, y1, x2, y2] (0, 1 ou 2+). Sem rosto para a faixa -> fundo desfocado.
+    """
+    fg = fit_to_width(frame)
+    if fg.shape[0] >= TARGET_H:
+        return crop_center_zoom(frame)
+    free = TARGET_H - fg.shape[0]
+    top_h = free // 2
+    bottom_h = free - top_h
+    faces = list(faces or [])
+
+    canvas = None
+    if len(faces) < 2:
+        canvas = blur_background(frame)
+    else:
+        canvas = np.empty((TARGET_H, TARGET_W, 3), dtype=np.uint8)
+
+    if top_h > 0 and len(faces) >= 1:
+        canvas[:top_h] = crop_band(frame, faces[0], TARGET_W, top_h)
+    if bottom_h > 0 and len(faces) >= 2:
+        canvas[TARGET_H - bottom_h:] = crop_band(frame, faces[1], TARGET_W, bottom_h)
+    canvas[top_h:top_h + fg.shape[0]] = fg
+    return canvas

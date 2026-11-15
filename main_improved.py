@@ -98,6 +98,25 @@ def interactive_input_int(prompt_text):
         except ValueError:
             print(i18n("\nError: The value you entered is not an integer. Please try again."))
 
+# Enquadramento padrao por tipo de video. So preenche o que o usuario nao passou na CLI.
+# (As instrucoes para a IA por tipo ficam em create_viral_segments.VIDEO_TYPE_INSTRUCTIONS.)
+VIDEO_TYPE_PRESETS = {
+    "generic":    {"frame_layout": "crop",      "face_mode": "auto"},
+    "podcast":    {"frame_layout": "crop",      "face_mode": "auto"},
+    "entrevista": {"frame_layout": "crop",      "face_mode": "auto"},
+    "react":      {"frame_layout": "fit-faces", "face_mode": "auto"},
+    "vlog":       {"frame_layout": "crop",      "face_mode": "1"},
+    "gameplay":   {"frame_layout": "fit-faces", "face_mode": "auto"},
+    "aula":       {"frame_layout": "fit-blur",  "face_mode": "1"},
+}
+
+def apply_video_type_preset(args):
+    preset = VIDEO_TYPE_PRESETS.get(args.video_type, VIDEO_TYPE_PRESETS["generic"])
+    for key, value in preset.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    print(i18n("Video type: {} | Frame layout: {} | Face mode: {}").format(args.video_type, args.frame_layout, args.face_mode))
+
 def main():
     # Configuração de Argumentos via Linha de Comando (CLI)
     parser = argparse.ArgumentParser(description="ViralCutter CLI")
@@ -111,8 +130,10 @@ def main():
     parser.add_argument("--max-duration", type=int, default=90, help="Maximum segment duration (seconds)")
     parser.add_argument("--model", default="large-v3-turbo", help="Whisper model to use")
     
-    parser.add_argument("--ai-backend", choices=["manual", "gemini", "g4f", "local"], help="AI backend for viral analysis")
-    parser.add_argument("--api-key", help="Gemini API Key (required if ai-backend is gemini)")
+    parser.add_argument("--ai-backend", choices=["manual", "gemini", "g4f", "local", "openai", "anthropic"], help="AI backend for viral analysis. 'openai' = any OpenAI-compatible API (OpenAI, OpenRouter, Groq, DeepSeek, Ollama...)")
+    parser.add_argument("--api-key", help="API key for the selected AI backend (gemini / openai / anthropic)")
+    parser.add_argument("--api-base-url", help="Base URL for --ai-backend openai (default: https://api.openai.com/v1; e.g. https://openrouter.ai/api/v1, http://localhost:11434/v1)")
+    parser.add_argument("--video-type", choices=list(VIDEO_TYPE_PRESETS.keys()), default="generic", help="Video type: sets default framing and guides the AI segment selection")
     
     parser.add_argument("--chunk-size", help="Override Chunk Size")
     parser.add_argument("--ai-model-name", help="Override AI Model Name")
@@ -120,10 +141,11 @@ def main():
     parser.add_argument("--project-path", help="Path to existing project folder (overrides URL/Latest)")
     parser.add_argument("--workflow", choices=["1", "2", "3"], default="1", help="Workflow choice: 1=Full, 2=Cut Only, 3=Subtitles Only")
     parser.add_argument("--face-model", choices=["insightface", "mediapipe"], default="insightface", help="Face detection model")
-    parser.add_argument("--face-mode", choices=["auto", "1", "2"], default="auto", help="Face tracking mode: auto, 1, 2")
+    parser.add_argument("--face-mode", choices=["auto", "1", "2"], default=None, help="Face tracking mode: auto, 1, 2 (default: from --video-type)")
+    parser.add_argument("--frame-layout", choices=list(edit_video.FRAME_LAYOUTS), default=None, help="crop = 9:16 crop following faces; fit-blur = full video centered over blurred background; fit-faces = full video centered with face zooms above/below (default: from --video-type)")
     parser.add_argument("--subtitle-config", help="Path to subtitle configuration JSON file")
     parser.add_argument("--no-face-mode", choices=["padding", "zoom"], default="padding", help="Method to handle segments with no face detected: 'padding' (9:16 frame with black bars) or 'zoom' (Center Crop Zoom)")
-    parser.add_argument("--face-detect-interval", type=str, default="0.17,1.0", help="Face detection interval in seconds. Single value or 'interval_1face,interval_2face'")
+    parser.add_argument("--face-detect-interval", type=str, default="0.17,0.5", help="Face detection interval in seconds. Single value or 'interval_1face,interval_2face'")
     parser.add_argument("--face-filter-threshold", type=float, default=0.35, help="Relative area threshold to ignore background faces (default: 0.35)")
     parser.add_argument("--face-two-threshold", type=float, default=0.60, help="Relative area threshold to trigger 2-face mode (default: 0.60)")
     parser.add_argument("--face-confidence-threshold", type=float, default=0.30, help="Face detection confidence threshold (0.0 - 1.0) (default: 0.30)")
@@ -141,6 +163,7 @@ def main():
     parser.add_argument("--translate-target", help="Target language code for subtitle translation (e.g. 'pt', 'en').")
 
     args = parser.parse_args()
+    apply_video_type_preset(args)
     
     # Workflow Logic
     workflow_choice = args.workflow
@@ -313,10 +336,16 @@ def main():
                 print(i18n("2. G4F (Free / Experimental)"))
                 print(i18n("3. Local (GGUF via llama.cpp)"))
                 print(i18n("4. Manual (Copy/Paste Prompt)"))
-                choice = input(i18n("Choose (1-4): ")).strip()
+                print(i18n("5. OpenAI-compatible API (OpenAI, OpenRouter, Groq, DeepSeek, Ollama...)"))
+                print(i18n("6. Anthropic (Claude)"))
+                choice = input(i18n("Choose (1-6): ")).strip()
                 
                 if choice == "1":
                     ai_backend = "gemini"
+                elif choice == "5":
+                    ai_backend = "openai"
+                elif choice == "6":
+                    ai_backend = "anthropic"
                 elif choice == "2":
                     ai_backend = "g4f"
                 elif choice == "3":
@@ -364,6 +393,20 @@ def main():
              else:
                  print(i18n("Gemini API Key not found in api_config.json or arguments."))
                  api_key = input(i18n("Enter your Gemini API Key: ")).strip()
+
+        # OpenAI-compativel / Anthropic: argumento -> api_config.json -> variavel de ambiente
+        if ai_backend in ("openai", "anthropic") and not api_key:
+            env_var = "OPENAI_API_KEY" if ai_backend == "openai" else "ANTHROPIC_API_KEY"
+            api_key = api_config.get(ai_backend, {}).get("api_key", "") or os.environ.get(env_var, "")
+            if not api_key:
+                is_local_server = ai_backend == "openai" and args.api_base_url and any(
+                    h in args.api_base_url for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+                if is_local_server:
+                    pass  # Ollama / LM Studio nao exigem chave
+                elif args.skip_prompts:
+                    print(i18n("{} API key missing (argument, api_config.json or {}). Might fail.").format(ai_backend, env_var))
+                else:
+                    api_key = input(i18n("Enter your {} API Key: ").format(ai_backend)).strip()
 
     # Workflow & Face Config Inputs
     workflow_choice = args.workflow
@@ -478,7 +521,9 @@ def main():
                         api_key=api_key,
                         project_folder=project_folder,
                         chunk_size_arg=args.chunk_size,
-                        model_name_arg=args.ai_model_name
+                        model_name_arg=args.ai_model_name,
+                        video_type=args.video_type,
+                        base_url=args.api_base_url
                     )
                 
                 if not viral_segments or not viral_segments.get("segments"):
@@ -578,7 +623,8 @@ def main():
                 active_speaker_motion_sensitivity=args.active_speaker_motion_sensitivity,
                 active_speaker_decay=args.active_speaker_decay,
                 segments_data=viral_segments.get("segments", []) if viral_segments else None,
-                no_face_mode=args.no_face_mode
+                no_face_mode=args.no_face_mode,
+                frame_layout=args.frame_layout
             )
 
 
@@ -669,6 +715,10 @@ def main():
                     used_ai_model = api_config.get("gemini", {}).get("model", "default")
                 elif ai_backend == "g4f":
                     used_ai_model = api_config.get("g4f", {}).get("model", "default")
+                elif ai_backend == "openai":
+                    used_ai_model = api_config.get("openai", {}).get("model", create_viral_segments.DEFAULT_OPENAI_MODEL)
+                elif ai_backend == "anthropic":
+                    used_ai_model = api_config.get("anthropic", {}).get("model", create_viral_segments.DEFAULT_ANTHROPIC_MODEL)
             
             # Ensure sub_config exists
             current_sub_config = sub_config if 'sub_config' in locals() else get_subtitle_config(args.subtitle_config)
@@ -684,7 +734,9 @@ def main():
                     "num_segments": num_segments,
                     "chunk_size": args.chunk_size
                 },
+                "video_type": args.video_type,
                 "face_config": {
+                    "frame_layout": args.frame_layout,
                     "model": face_model,
                     "mode": face_mode,
                     "detect_interval": args.face_detect_interval,
