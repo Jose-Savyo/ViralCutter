@@ -129,6 +129,7 @@ def main():
     parser.add_argument("--min-duration", type=int, default=15, help="Minimum segment duration (seconds)")
     parser.add_argument("--max-duration", type=int, default=90, help="Maximum segment duration (seconds)")
     parser.add_argument("--model", default="large-v3-turbo", help="Whisper model to use")
+    parser.add_argument("--whisper-batch-size", type=int, default=None, help="Whisper batch size (default: automatic by GPU VRAM; 4 on CPU)")
     
     parser.add_argument("--ai-backend", choices=["manual", "gemini", "g4f", "local", "openai", "anthropic"], help="AI backend for viral analysis. 'openai' = any OpenAI-compatible API (OpenAI, OpenRouter, Groq, DeepSeek, Ollama...)")
     parser.add_argument("--api-key", help="API key for the selected AI backend (gemini / openai / anthropic)")
@@ -484,7 +485,7 @@ def main():
         else:
             print(i18n("Transcribing with model {}...").format(args.model))
             # Se skip config, args.model é default
-            srt_file, tsv_file = transcribe_video.transcribe(input_video, args.model, project_folder=project_folder)
+            srt_file, tsv_file = transcribe_video.transcribe(input_video, args.model, project_folder=project_folder, batch_size=args.whisper_batch_size)
  
         # 3. Create Viral Segments
         if workflow_choice != "3":

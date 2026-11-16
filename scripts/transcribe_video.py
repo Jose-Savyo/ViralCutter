@@ -173,7 +173,33 @@ def parse_vtt(vtt_path):
         return None
     return segments
 
-def transcribe(input_file, model_name='large-v3', project_folder='tmp'):
+def pick_batch_size(device):
+    """Escolhe o batch do Whisper pela VRAM total. Env VIRALCUTTER_WHISPER_BATCH força um valor."""
+    forced = os.environ.get("VIRALCUTTER_WHISPER_BATCH")
+    if forced:
+        try:
+            return max(1, int(forced))
+        except ValueError:
+            print(f"VIRALCUTTER_WHISPER_BATCH inválido ({forced}); usando automático.")
+    if device != "cuda":
+        return 4
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if total_gb >= 40:
+        return 64
+    if total_gb >= 20:
+        return 48
+    if total_gb >= 14:
+        return 32
+    if total_gb >= 8:
+        return 16
+    return 8
+
+
+def _is_oom(e):
+    return isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()
+
+
+def transcribe(input_file, model_name='large-v3', project_folder='tmp', batch_size=None):
     print(i18n(f"Iniciando transcrição de {input_file}..."))
     
     # Diagnóstico de Ambiente
@@ -203,7 +229,10 @@ def transcribe(input_file, model_name='large-v3', project_folder='tmp'):
     # Device Setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"DEBUG: Usando dispositivo: {device}")
-    compute_type = "float16" if device == "cuda" else "float32"
+    # CPU: int8 usa ~metade da RAM do float32 (pico ~2 GB com batch 4 no large-v3-turbo)
+    compute_type = "float16" if device == "cuda" else "int8"
+    if batch_size is None:
+        batch_size = pick_batch_size(device)
 
     try:
         apply_safe_globals_hack()
@@ -267,11 +296,23 @@ def transcribe(input_file, model_name='large-v3', project_folder='tmp'):
                 asr_options={"hotwords": None}
             )
 
-            result = model.transcribe(
-                audio, 
-                batch_size=16, 
-                chunk_size=10
-            )
+            while True:
+                try:
+                    print(f"Transcrevendo com batch_size={batch_size} ({compute_type})...")
+                    result = model.transcribe(
+                        audio, 
+                        batch_size=batch_size, 
+                        chunk_size=10
+                    )
+                    break
+                except (RuntimeError, MemoryError) as e:
+                    if device == "cuda" and _is_oom(e) and batch_size > 1:
+                        batch_size = max(1, batch_size // 2)
+                        print(f"Sem VRAM suficiente; tentando de novo com batch_size={batch_size}.")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        continue
+                    raise
             
             detected_language = result["language"]
             start_segments = result["segments"]
