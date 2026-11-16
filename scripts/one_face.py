@@ -177,23 +177,18 @@ def fit_to_width(frame, width=TARGET_W):
     return cv2.resize(frame, (width, h), interpolation=cv2.INTER_AREA)
 
 
-def crop_band(frame, bbox, band_w, band_h, face_scale=2.6):
+def crop_band(frame, bbox, band_w, band_h, face_scale=2.4, crop_aspect=1.0):
     """
-    Recorta uma regiao com a proporcao da faixa (band_w x band_h) centrada no rosto
-    bbox = [x1, y1, x2, y2]. face_scale = altura do recorte / altura do rosto.
+    Zoom no rosto para uma faixa band_w x band_h.
+    Recorta uma regiao quase quadrada (crop_aspect = w/h) em volta do rosto, para nao pegar
+    o que esta ao lado (player, outras webcams), e centraliza na faixa sobre um fundo desfocado
+    do proprio recorte. bbox = [x1, y1, x2, y2]; face_scale = altura do recorte / altura do rosto.
     """
     fh, fw = frame.shape[:2]
-    aspect = band_w / band_h
     x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
     face_h = max(1.0, y2 - y1)
-    crop_h = max(face_h * face_scale, 48.0)
-    crop_w = crop_h * aspect
-    if crop_w > fw:
-        crop_w = float(fw)
-        crop_h = crop_w / aspect
-    if crop_h > fh:
-        crop_h = float(fh)
-        crop_w = crop_h * aspect
+    crop_h = min(max(face_h * face_scale, 48.0), float(fh))
+    crop_w = min(crop_h * crop_aspect, float(fw))
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2 + 0.15 * face_h  # desce um pouco para mostrar ombros
     cx0 = int(round(min(max(cx - crop_w / 2, 0), fw - crop_w)))
@@ -201,7 +196,20 @@ def crop_band(frame, bbox, band_w, band_h, face_scale=2.6):
     crop = frame[cy0:cy0 + int(crop_h), cx0:cx0 + int(crop_w)]
     if crop.size == 0:
         return blur_background(frame, band_w, band_h)
-    return cv2.resize(crop, (band_w, band_h), interpolation=cv2.INTER_LINEAR)
+
+    ch, cw = crop.shape[:2]
+    scale = band_h / ch
+    out_w = int(round(cw * scale))
+    if out_w >= band_w:  # recorte ja preenche a largura
+        out_h = int(round(band_w * ch / cw))
+        fg = cv2.resize(crop, (band_w, max(out_h, band_h)), interpolation=cv2.INTER_LINEAR)
+        y = (fg.shape[0] - band_h) // 2
+        return fg[y:y + band_h]
+    fg = cv2.resize(crop, (out_w, band_h), interpolation=cv2.INTER_LINEAR)
+    canvas = blur_background(crop, band_w, band_h)
+    x = (band_w - out_w) // 2
+    canvas[:, x:x + out_w] = fg
+    return canvas
 
 
 def compose_fit_blur(frame):

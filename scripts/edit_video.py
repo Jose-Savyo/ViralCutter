@@ -76,6 +76,46 @@ def is_scene_cut(prev_hist, cur_hist, threshold=SCENE_CUT_THRESHOLD):
         return False
     return cv2.compareHist(prev_hist, cur_hist, cv2.HISTCMP_CORREL) < threshold
 
+# --- fit-faces: rostos persistentes e layout adaptativo ---
+FIT_BIG_FACE_RATIO = 0.18      # rosto com altura > 18% do quadro = camera de estudio -> usa crop
+FIT_SWITCH_SECONDS = 0.75      # tempo minimo antes de trocar crop <-> fit-faces (fora troca de cena)
+FIT_CONTENT_FACE_FACTOR = 1.6  # com 3+ rostos, maior > 1.6x o segundo = conteudo da tela, nao webcam
+
+
+class FacePersistence:
+    """
+    Conta em quantas deteccoes cada regiao do quadro teve rosto. Webcams de transmissao ficam
+    sempre no mesmo lugar; rostos do jogo/video aparecem, somem e se movem.
+    """
+    def __init__(self, cols=16, rows=9, min_rounds=6):
+        self.cols, self.rows, self.min_rounds = cols, rows, min_rounds
+        self.hits = np.zeros((rows, cols), dtype=np.float32)
+        self.rounds = 0
+
+    def _cell(self, center, fw, fh):
+        cx = min(self.cols - 1, max(0, int(center[0] / fw * self.cols)))
+        cy = min(self.rows - 1, max(0, int(center[1] / fh * self.rows)))
+        return cy, cx
+
+    def update(self, faces, fw, fh):
+        self.rounds += 1
+        seen = set(self._cell(f['center'], fw, fh) for f in faces)
+        for cy, cx in seen:
+            self.hits[cy, cx] += 1
+
+    def score(self, center, fw, fh):
+        if self.rounds < self.min_rounds:
+            return 0.0
+        cy, cx = self._cell(center, fw, fh)
+        y0, y1 = max(0, cy - 1), min(self.rows, cy + 2)
+        x0, x1 = max(0, cx - 1), min(self.cols, cx + 2)
+        return float(min(1.0, self.hits[y0:y1, x0:x1].max() / self.rounds))
+
+
+def face_height_ratio(bbox, frame_h):
+    return max(0.0, float(bbox[3]) - float(bbox[1])) / max(1.0, float(frame_h))
+
+
 def render_no_face(frame, frame_layout="crop", no_face_mode="padding"):
     """Quadro sem rosto utilizavel, respeitando o layout escolhido."""
     if frame_layout == "fit-blur":
@@ -561,6 +601,14 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     # A list of dictionaries: [{'center': (x,y), 'activity': score}, ...]
     faces_activity_state = [] 
     
+    # fit-faces: persistencia de rostos + troca crop <-> fit por cena
+    face_persistence = FacePersistence()
+    fit_sub_layout = None          # "fit" ou "crop"
+    fit_candidate, fit_candidate_frames = None, 0
+    fit_switch_frames = max(1, int(FIT_SWITCH_SECONDS * fps))
+    fit_scene_reset = True
+    fit_crop_frames = 0
+
     for frame_index in range(total_frames):
         if buffered_frame is not None:
              frame = buffered_frame
@@ -585,6 +633,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             last_frame_face_positions = None
             last_success_frame = -1000
             faces_activity_state = []
+            fit_scene_reset = True
         prev_hist = cur_hist
 
         if frame_index >= next_detection_frame and len(transition_frames) == 0:
@@ -618,11 +667,31 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                         act = f.get('activity', 0)
                         f['effective_area'] = f['area'] * (1.0 + (act * 0.05))
 
+                    if frame_layout == "fit-faces":
+                        # Rosto que fica sempre no mesmo lugar (webcam) pesa mais que rosto do jogo/video
+                        face_persistence.update(faces, frame_width, frame_height)
+                        for f in faces:
+                            f['persistence'] = face_persistence.score(f['center'], frame_width, frame_height)
+                            f['effective_area'] *= (1.0 + 4.0 * f['persistence'])
+                        size_key = 'effective_area'
+                        # Tela de transmissao: varias webcams de tamanho parecido + um rosto bem maior
+                        # no conteudo (personagem do jogo/video). Esse rosto ja aparece no video central,
+                        # entao sai das faixas. Rosto de camera de estudio (grande) nao e afetado.
+                        if len(faces) >= 3:
+                            by_area = sorted(faces, key=lambda f: f['area'], reverse=True)
+                            top, second = by_area[0], by_area[1]
+                            if (top['area'] > FIT_CONTENT_FACE_FACTOR * second['area']
+                                    and face_height_ratio(top['bbox'], frame_height) <= FIT_BIG_FACE_RATIO):
+                                print(f"DEBUG: Frame {frame_index} | fit-faces: ignorando rosto do conteudo da tela ({top['area']/second['area']:.1f}x o segundo)")
+                                faces = [f for f in faces if f is not top]
+                    else:
+                        size_key = 'area'
+
                     # Find largest face
-                    max_area = max(f['area'] for f in faces)
+                    max_area = max(f[size_key] for f in faces)
                     
                     # 2. Relative Size Filter
-                    valid_faces = [f for f in faces if f['area'] > (filter_threshold * max_area)]
+                    valid_faces = [f for f in faces if f[size_key] > (filter_threshold * max_area)]
                     
                     if len(valid_faces) < len(faces):
                         print(f"DEBUG: Filtered {len(faces)-len(valid_faces)} small faces. Max Area: {max_area}. Filter Thresh: {filter_threshold}")
@@ -1024,7 +1093,34 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         
         target_len = len(current_faces)
 
+        use_fit = False
         if frame_layout == "fit-faces":
+             # Cena de camera unica (rosto grande) -> crop normal; tela com webcams pequenas -> fit-faces.
+             big = face_height_ratio(current_faces[0], frame_height) > FIT_BIG_FACE_RATIO
+             wanted = "crop" if big else "fit"
+             if fit_sub_layout is None or fit_scene_reset:
+                 fit_sub_layout = wanted
+                 fit_scene_reset = False
+                 fit_candidate, fit_candidate_frames = None, 0
+             elif wanted != fit_sub_layout:
+                 if wanted == fit_candidate:
+                     fit_candidate_frames += 1
+                 else:
+                     fit_candidate, fit_candidate_frames = wanted, 1
+                 if fit_candidate_frames >= fit_switch_frames:
+                     fit_sub_layout = wanted
+                     fit_candidate, fit_candidate_frames = None, 0
+             else:
+                 fit_candidate, fit_candidate_frames = None, 0
+             use_fit = fit_sub_layout == "fit"
+             if not use_fit:
+                 fit_crop_frames += 1
+                 # No crop, so divide a tela se os dois rostos forem grandes
+                 if target_len == 2 and face_height_ratio(current_faces[1], frame_height) <= FIT_BIG_FACE_RATIO * 0.6:
+                     current_faces = [current_faces[0]]
+                     target_len = 1
+
+        if use_fit:
              # Video inteiro no centro + zoom nos rostos nas faixas de cima/baixo.
              # Legenda na posicao padrao (modo "1"), logo abaixo do video central.
              if target_len == 2:
@@ -1131,7 +1227,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     except Exception as e:
         print(f"Error saving coords: {e}")
 
-    print(f"Summary: {scene_cut_count} scene cut(s) | 1-face frames: {frame_1_face_count} | 2-face frames: {frame_2_face_count} | total: {total_frames}")
+    print(f"Summary: {scene_cut_count} scene cut(s) | 1-face frames: {frame_1_face_count} | 2-face frames: {frame_2_face_count} | fit-faces->crop frames: {fit_crop_frames} | total: {total_frames}")
     finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
     # Return dominant mode logic (or keep 15% rule as overall fallback)
