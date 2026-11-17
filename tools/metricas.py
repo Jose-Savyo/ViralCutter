@@ -33,7 +33,26 @@ def _crop_center(entry, crop_w):
     return min(max(cx, crop_w / 2.0), src_w - crop_w / 2.0)
 
 
-def camera_metrics(coords, fps=29.97):
+def scene_cut_frames(video_path):
+    """Quadros com troca de cena, pelo mesmo criterio do enquadramento (histograma HSV)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import cv2
+    from scripts.edit_video import frame_histogram, is_scene_cut
+    cap = cv2.VideoCapture(video_path)
+    cuts, prev, i = set(), None, 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cur = frame_histogram(frame)
+        if is_scene_cut(prev, cur):
+            cuts.add(i)
+        prev, i = cur, i + 1
+    cap.release()
+    return cuts
+
+
+def camera_metrics(coords, fps=29.97, scene_cuts=None):
     if not coords:
         return {}
     src_w, src_h = (coords[0].get("src_size") or [1920, 1080])[:2]
@@ -42,16 +61,24 @@ def camera_metrics(coords, fps=29.97):
     xs = [_crop_center(e, crop_w) for e in coords]
     layouts = [e.get("layout") or (f"{len(e.get('faces') or [])}f") for e in coords]
 
-    moving_frames = cuts = movements = reversals = 0
+    moving_frames = cuts = movements = reversals = scene_jumps = 0
     travel = 0.0
     prev_dir = 0
     in_move = False
+    still = 0
+    end_after = max(1, int(round(0.25 * fps)))   # movimento so termina depois de 0,25 s parado
     for i in range(1, len(xs)):
         a, b = xs[i - 1], xs[i]
         if a is None or b is None:
             in_move = False
             continue
         dx = b - a
+        if scene_cuts is not None and i in scene_cuts:
+            if abs(dx) > 0.5:
+                scene_jumps += 1
+            in_move = False
+            prev_dir = 0
+            continue
         if abs(dx) >= cut_jump:
             cuts += 1
             in_move = False
@@ -60,6 +87,7 @@ def camera_metrics(coords, fps=29.97):
         if abs(dx) > 0.5:
             moving_frames += 1
             travel += abs(dx)
+            still = 0
             d = 1 if dx > 0 else -1
             if not in_move:
                 movements += 1
@@ -68,7 +96,9 @@ def camera_metrics(coords, fps=29.97):
                 reversals += 1
             prev_dir = d
         else:
-            in_move = False
+            still += 1
+            if still >= end_after:
+                in_move = False
     layout_changes = sum(1 for i in range(1, len(layouts)) if layouts[i] != layouts[i - 1])
     duration = len(xs) / float(fps)
     minutes = duration / 60.0 if duration else 1.0
@@ -79,6 +109,7 @@ def camera_metrics(coords, fps=29.97):
         "deslocamento_px_s": round(travel / duration, 1) if duration else 0.0,
         "quadros_em_movimento_pct": round(100.0 * moving_frames / max(1, len(xs) - 1), 1),
         "cortes_secos": cuts,
+        "saltos_em_troca_de_cena": scene_jumps,
         "trocas_de_layout_por_min": round(layout_changes / minutes, 2),
         "quadros_sem_rosto_pct": round(100.0 * sum(1 for x in xs if x is None) / len(xs), 1),
     }
@@ -139,6 +170,7 @@ def main():
     c.add_argument("coords")
     c.add_argument("--fps", type=float, default=29.97)
     c.add_argument("--json", action="store_true")
+    c.add_argument("--video", help="corte de origem (_original_scale.mp4): desconta as trocas de cena")
     l = sub.add_parser("limites")
     l.add_argument("projeto")
     l.add_argument("--json", action="store_true")
@@ -148,7 +180,7 @@ def main():
 
     if a.cmd == "camera":
         with open(a.coords, encoding="utf-8") as f:
-            m = camera_metrics(json.load(f), a.fps)
+            m = camera_metrics(json.load(f), a.fps, scene_cut_frames(a.video) if a.video else None)
         print(json.dumps(m, ensure_ascii=False) if a.json else "\n".join(f"{k}: {v}" for k, v in m.items()))
     elif a.cmd == "limites":
         summary, rows = boundary_metrics(a.projeto)

@@ -177,6 +177,19 @@ def fit_to_width(frame, width=TARGET_W):
     return cv2.resize(frame, (width, h), interpolation=cv2.INTER_AREA)
 
 
+def subpixel_crop_resize(frame, x0, y0, w, h, out_w, out_h):
+    """
+    Recorta (x0, y0, w, h) em ponto flutuante e redimensiona para out_w x out_h numa so operacao.
+    Com a ampliacao de ~1,8x do recorte 9:16, cortar em pixel inteiro fazia o movimento lento
+    andar "em degraus"; aqui a posicao fracionaria e interpolada.
+    """
+    sx = out_w / float(w)
+    sy = out_h / float(h)
+    m = np.float32([[sx, 0.0, -float(x0) * sx], [0.0, sy, -float(y0) * sy]])
+    return cv2.warpAffine(frame, m, (int(out_w), int(out_h)), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
 def crop_band(frame, bbox, band_w, band_h, face_scale=3.0, crop_aspect=1.0):
     """
     Zoom no rosto para uma faixa band_w x band_h.
@@ -191,22 +204,17 @@ def crop_band(frame, bbox, band_w, band_h, face_scale=3.0, crop_aspect=1.0):
     crop_w = min(crop_h * crop_aspect, float(fw))
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2 + 0.15 * face_h  # desce um pouco para mostrar ombros
-    cx0 = int(round(min(max(cx - crop_w / 2, 0), fw - crop_w)))
-    cy0 = int(round(min(max(cy - crop_h / 2, 0), fh - crop_h)))
-    crop = frame[cy0:cy0 + int(crop_h), cx0:cx0 + int(crop_w)]
-    if crop.size == 0:
-        return blur_background(frame, band_w, band_h)
+    x0 = min(max(cx - crop_w / 2, 0.0), fw - crop_w)
+    y0 = min(max(cy - crop_h / 2, 0.0), fh - crop_h)
 
-    ch, cw = crop.shape[:2]
-    scale = band_h / ch
-    out_w = int(round(cw * scale))
-    if out_w >= band_w:  # recorte ja preenche a largura
-        out_h = int(round(band_w * ch / cw))
-        fg = cv2.resize(crop, (band_w, max(out_h, band_h)), interpolation=cv2.INTER_LINEAR)
-        y = (fg.shape[0] - band_h) // 2
+    out_w = int(round(crop_w * band_h / crop_h))
+    if out_w >= band_w:  # recorte ja preenche a largura: usa a faixa do meio
+        out_h = max(band_h, int(round(crop_h * band_w / crop_w)))
+        fg = subpixel_crop_resize(frame, x0, y0, crop_w, crop_h, band_w, out_h)
+        y = (out_h - band_h) // 2
         return fg[y:y + band_h]
-    fg = cv2.resize(crop, (out_w, band_h), interpolation=cv2.INTER_LINEAR)
-    canvas = blur_background(crop, band_w, band_h)
+    fg = subpixel_crop_resize(frame, x0, y0, crop_w, crop_h, out_w, band_h)
+    canvas = blur_background(fg, band_w, band_h)
     x = (band_w - out_w) // 2
     canvas[:, x:x + out_w] = fg
     return canvas

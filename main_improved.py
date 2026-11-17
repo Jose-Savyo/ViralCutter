@@ -102,13 +102,13 @@ def interactive_input_int(prompt_text):
 # Enquadramento padrao por tipo de video. So preenche o que o usuario nao passou na CLI.
 # (As instrucoes para a IA por tipo ficam em create_viral_segments.VIDEO_TYPE_INSTRUCTIONS.)
 VIDEO_TYPE_PRESETS = {
-    "generic":    {"frame_layout": "crop",      "face_mode": "auto"},
-    "podcast":    {"frame_layout": "crop",      "face_mode": "auto"},
-    "entrevista": {"frame_layout": "crop",      "face_mode": "auto"},
-    "react":      {"frame_layout": "fit-faces", "face_mode": "auto"},
-    "vlog":       {"frame_layout": "crop",      "face_mode": "1"},
-    "gameplay":   {"frame_layout": "fit-faces", "face_mode": "auto"},
-    "aula":       {"frame_layout": "fit-blur",  "face_mode": "1"},
+    "generic":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "normal"},
+    "podcast":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm"},
+    "entrevista": {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm"},
+    "react":      {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal"},
+    "vlog":       {"frame_layout": "crop",      "face_mode": "1",    "camera_style": "dynamic"},
+    "gameplay":   {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal"},
+    "aula":       {"frame_layout": "fit-blur",  "face_mode": "1",    "camera_style": "calm"},
 }
 
 def apply_video_type_preset(args):
@@ -117,6 +117,7 @@ def apply_video_type_preset(args):
         if getattr(args, key) is None:
             setattr(args, key, value)
     print(i18n("Video type: {} | Frame layout: {} | Face mode: {}").format(args.video_type, args.frame_layout, args.face_mode))
+    print(f"Camera: {args.camera_style}")
 
 def main():
     # Configuração de Argumentos via Linha de Comando (CLI)
@@ -144,6 +145,7 @@ def main():
     parser.add_argument("--workflow", choices=["1", "2", "3"], default="1", help="Workflow choice: 1=Full, 2=Cut Only, 3=Subtitles Only")
     parser.add_argument("--face-model", choices=["insightface", "mediapipe"], default="insightface", help="Face detection model")
     parser.add_argument("--face-mode", choices=["auto", "1", "2"], default=None, help="Face tracking mode: auto, 1, 2 (default: from --video-type)")
+    parser.add_argument("--camera-style", choices=list(edit_video.CAMERA_STYLES), default=None, help="Virtual camera: calm (holds longer), normal, dynamic (follows faster). Default: from --video-type")
     parser.add_argument("--frame-layout", choices=list(edit_video.FRAME_LAYOUTS), default=None, help="crop = 9:16 crop following faces; fit-blur = full video centered over blurred background; fit-faces = full video centered with face zooms above/below (default: from --video-type)")
     parser.add_argument("--subtitle-config", help="Path to subtitle configuration JSON file")
     parser.add_argument("--no-face-mode", choices=["padding", "zoom"], default="padding", help="Method to handle segments with no face detected: 'padding' (9:16 frame with black bars) or 'zoom' (Center Crop Zoom)")
@@ -638,7 +640,8 @@ def main():
                 active_speaker_decay=args.active_speaker_decay,
                 segments_data=viral_segments.get("segments", []) if viral_segments else None,
                 no_face_mode=args.no_face_mode,
-                frame_layout=args.frame_layout
+                frame_layout=args.frame_layout,
+                camera_style=args.camera_style
             )
 
 
@@ -752,6 +755,7 @@ def main():
                 "video_type": args.video_type,
                 "face_config": {
                     "frame_layout": args.frame_layout,
+                    "camera_style": args.camera_style,
                     "model": face_model,
                     "mode": face_mode,
                     "detect_interval": args.face_detect_interval,

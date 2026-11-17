@@ -3,7 +3,8 @@ import numpy as np
 import os
 import subprocess
 import mediapipe as mp
-from scripts.one_face import crop_and_resize_single_face, resize_with_padding, detect_face_or_body, crop_center_zoom, compose_fit_blur, compose_fit_faces
+from scripts.one_face import crop_and_resize_single_face, resize_with_padding, detect_face_or_body, crop_center_zoom, compose_fit_blur, compose_fit_faces, subpixel_crop_resize
+from scripts.virtual_camera import CameraRig, crop_window, CAMERA_STYLES
 from scripts.two_face import crop_and_resize_two_faces, detect_face_or_body_two_faces
 from scripts.stage_timer import ClipTimer, save_clip_timings
 try:
@@ -587,7 +588,7 @@ def generate_short_haar(input_file, output_file, index, project_folder, final_fo
 
     finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
-def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding", frame_layout="crop"):
+def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding", frame_layout="crop", camera_style="normal"):
     """Face detection using InsightFace (SOTA)."""
     print(f"Processing (InsightFace): {input_file} | Mode: {face_mode} | Layout: {frame_layout}")
     
@@ -622,6 +623,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     transition_duration = max(4, int(REFRAME_SECONDS * fps))
     stable_zone = max(float(dead_zone), STABLE_ZONE_RATIO * frame_height)
     transition_frames = []
+    # Camera virtual v2 (zona de conforto, confirmacao de salto, mola, corte seco na troca de pessoa)
+    rig = CameraRig(frame_width, frame_height, fps, camera_style, dead_zone)
 
     # Current state of face mode (1 or 2)
     # If auto, we decide per detection interval
@@ -686,6 +689,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             last_success_frame = -1000
             faces_activity_state = []
             fit_scene_reset = True
+            rig.reset(frame_index / fps)
         prev_hist = cur_hist
 
         if frame_index >= next_detection_frame and len(transition_frames) == 0:
@@ -793,6 +797,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                 transition_frames = []
                 faces_activity_state = [] 
                 zoom_ema_bbox = None # Reset smoothing too
+                rig.reset()
             # ---------------------------
 
             # Update Activity State - Two Pass for Global Motion Compensation
@@ -1048,61 +1053,12 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                      detections = []
 
             if detections:
-                # --- STABILIZATION (DEAD ZONE) ---
-                # Check if movement is small enough to ignore
-                if last_detected_faces is not None and len(last_detected_faces) == len(detections):
-                    is_stable = True
-                    for i in range(len(detections)):
-                        old_c = get_center_bbox(last_detected_faces[i])
-                        new_c = get_center_bbox(detections[i])
-                        # Zona estavel: ignora movimentos pequenos (cabeca balancando, ruido da deteccao)
-                        if abs(old_c[0]-new_c[0]) > stable_zone or abs(old_c[1]-new_c[1]) > stable_zone: 
-                            is_stable = False
-                            break
-                    
-                    if is_stable:
-                        # Keep old position to prevent "shaky cam"
-                        detections = last_detected_faces
-                        # Clear transition logic (snap) or keep it empty
-                        transition_frames = []
-                # ---------------------------------
-
-                if last_frame_face_positions is not None and len(last_frame_face_positions) == len(detections):
-                    # Only transition if we decided to MOVE (i.e., not stable)
-                    forced_transition = True
-                    if last_detected_faces is not None and len(detections) == len(last_detected_faces):
-                         # Manual check to avoid numpy ambiguity
-                         arrays_equal = True
-                         for i in range(len(detections)):
-                             if not np.array_equal(detections[i], last_detected_faces[i]):
-                                 arrays_equal = False
-                                 break
-                         if arrays_equal:
-                             forced_transition = False
-
-                    if not transition_frames and forced_transition:
-                        # Transition
-                        start_faces = np.array(last_frame_face_positions)
-                        end_faces = np.array(detections)
-                        
-                        steps = transition_duration
-                        transition_frames = []
-                        for s in range(steps):
-                            t = (s + 1) / steps
-                            t = t * t * (3 - 2 * t)  # ease-in-out: sem tranco no inicio/fim
-                            interp = (1 - t) * start_faces + t * end_faces
-                            transition_frames.append(interp.astype(int).tolist())
-                        
-                        # Optimization removed to avoid "Ambiguous truth value of array" error
-                        # if detections == last_detected_faces: caused crash
-                    
-                else:
-                    # Reset transition if face count changed or first detect
-                    transition_frames = []
+                t_now = frame_index / fps
+                if (frame_index - last_success_frame) > max_frames_without_detection:
+                    rig.reset()  # rosto perdido por muito tempo: volta com corte seco
+                rig.observe(detections, t_now)
                 last_detected_faces = detections
                 last_success_frame = frame_index
-            else:
-                pass
 
 
             # Update next detection frame based on NEW state
@@ -1125,11 +1081,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             
             next_detection_frame = frame_index + step
 
-        if len(transition_frames) > 0:
-            current_faces = transition_frames[0]
-            transition_frames = transition_frames[1:]
-        elif last_detected_faces is not None and (frame_index - last_success_frame) <= max_frames_without_detection:
-            current_faces = last_detected_faces
+        if rig.count and (frame_index - last_success_frame) <= max_frames_without_detection:
+            current_faces = rig.step(1.0 / fps)
         else:
             # Fallback for this frame
             result = render_no_face(frame, frame_layout, no_face_mode)
@@ -1138,7 +1091,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             timeline_frames.append((frame_index, "1")) # Fix: Ensure fallback is treated as single face for subs
             
             # Fix XML Log sync (Empty faces for fallback)
-            coords_entry = {"frame": frame_index, "src_size": [frame_width, frame_height], "faces": []}
+            coords_entry = {"frame": frame_index, "src_size": [frame_width, frame_height], "faces": [], "layout": "nenhum"}
             coordinate_log.append(coords_entry)
             
             continue
@@ -1148,6 +1101,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         target_len = len(current_faces)
 
         use_fit = False
+        crop_log = None
         if frame_layout == "fit-faces":
              # Cena de camera unica (rosto grande) -> crop normal; tela com webcams pequenas -> fit-faces.
              big = face_height_ratio(current_faces[0], frame_height) > FIT_BIG_FACE_RATIO
@@ -1196,11 +1150,16 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
              frame_1_face_count += 1
              # 1 face
              # current_faces[0] is [x1, y1, x2, y2]
-             result = crop_and_resize_insightface(frame, current_faces[0])
+             fx1, fy1, fx2, fy2 = [float(v) for v in current_faces[0][:4]]
+             crop_log = crop_window(frame_width, frame_height, (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0)
+             result = subpixel_crop_resize(frame, *crop_log, 1080, 1920)
              timeline_frames.append((frame_index, "1"))
              
         # Capture Coordinates (Frame-by-Frame)
-        coords_entry = {"frame": frame_index, "src_size": [frame_width, frame_height], "faces": []}
+        coords_entry = {"frame": frame_index, "src_size": [frame_width, frame_height], "faces": [],
+                        "layout": "fit" if use_fit else ("crop2" if target_len == 2 else "crop1")}
+        if crop_log is not None:
+            coords_entry["crop"] = [round(float(v), 1) for v in crop_log]
         try:
             # We want to store [x1, y1, x2, y2, rh] for each face
             if isinstance(current_faces, (list, tuple)):
@@ -1284,6 +1243,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         print(f"Error saving coords: {e}")
 
     print(f"Summary: {scene_cut_count} scene cut(s) | 1-face frames: {frame_1_face_count} | 2-face frames: {frame_2_face_count} | fit-faces->crop frames: {fit_crop_frames} | total: {total_frames}")
+    print(f"Camera ({rig.style}): {rig.stats['panoramicas']} panoramica(s), {rig.stats['cortes_pessoa']} corte(s) de pessoa, {rig.stats['trocas_layout']} troca(s) de layout")
     with ct.measure("mux"):
         finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
     CLIP_TIMINGS.append(ct.finish())
@@ -1294,7 +1254,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     return "1"
 
 
-def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop"):
+def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop", camera_style="normal"):
     CLIP_TIMINGS.clear()
     if frame_layout not in FRAME_LAYOUTS:
         print(f"WARNING: Unknown frame_layout '{frame_layout}'. Using 'crop'.")
@@ -1410,7 +1370,7 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
                                                      active_speaker_motion_deadzone=active_speaker_motion_deadzone,
                                                      active_speaker_motion_sensitivity=active_speaker_motion_sensitivity,
                                                      active_speaker_decay=active_speaker_decay,
-                                                     no_face_mode=no_face_mode, frame_layout=frame_layout)
+                                                     no_face_mode=no_face_mode, frame_layout=frame_layout, camera_style=camera_style)
                     if res: detected_mode = res
                     if frame_layout == "fit-faces":
                         detected_mode = "1"  # legenda na posicao padrao
