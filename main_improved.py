@@ -517,20 +517,25 @@ def main():
                     
                 if not viral_segments:
                     print(i18n("Creating viral segments using {}...").format(ai_backend.upper()))
-                    viral_segments = create_viral_segments.create(
-                        num_segments, 
-                        viral_mode, 
-                        themes, 
-                        args.min_duration, 
-                        args.max_duration,
-                        ai_mode=ai_backend,
-                        api_key=api_key,
-                        project_folder=project_folder,
-                        chunk_size_arg=args.chunk_size,
-                        model_name_arg=args.ai_model_name,
-                        video_type=args.video_type,
-                        base_url=args.api_base_url
-                    )
+                    try:
+                        viral_segments = create_viral_segments.create(
+                            num_segments, 
+                            viral_mode, 
+                            themes, 
+                            args.min_duration, 
+                            args.max_duration,
+                            ai_mode=ai_backend,
+                            api_key=api_key,
+                            project_folder=project_folder,
+                            chunk_size_arg=args.chunk_size,
+                            model_name_arg=args.ai_model_name,
+                            video_type=args.video_type,
+                            base_url=args.api_base_url
+                        )
+                    except create_viral_segments.AIQuotaError as quota_err:
+                        print(f"\n[COTA] {quota_err}")
+                        print(i18n("Stopping execution."))
+                        sys.exit(2)
                 
                 if not viral_segments or not viral_segments.get("segments"):
                     print(i18n("Error: No viral segments were generated."))

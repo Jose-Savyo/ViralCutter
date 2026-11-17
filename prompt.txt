@@ -30,6 +30,11 @@ The transcript below is a continuous text stream with embedded **Time Tags** lik
     -   Use the `(XXs)` tags to estimate duration.
     -   CONSTRAINT: Segment MUST be between {min_duration}s and {max_duration}s.
 
+5.  **TITLE vs HOOK:**
+    -   "title": a catchy title for the clip (max ~60 characters).
+    -   "hook": the short on-screen text shown at the start (max 10 words). It MUST be different from the title and describe THIS moment (what happens or is revealed), not the whole video.
+    -   "reasoning": one short sentence.
+
 ### VIDEO CONTEXT:
 {video_type_instruction}
 

@@ -15,11 +15,31 @@ if sys.stdout and hasattr(sys.stdout, 'buffer'):
         pass
 
 # Tenta importar bibliotecas de IA opcionalmente
+# Gemini: SDK novo (google-genai) com timeout e controle de raciocinio; o antigo
+# (google-generativeai, descontinuado) so e usado se o novo nao estiver instalado.
 try:
-    import google.generativeai as genai
-    HAS_GEMINI = True
+    from google import genai as google_genai
+    from google.genai import types as genai_types
+    from google.genai import errors as genai_errors
+    HAS_GENAI = True
 except ImportError:
-    HAS_GEMINI = False
+    HAS_GENAI = False
+
+genai = None
+HAS_GEMINI_LEGACY = False
+if not HAS_GENAI:
+    try:
+        import google.generativeai as genai
+        HAS_GEMINI_LEGACY = True
+    except ImportError:
+        pass
+HAS_GEMINI = HAS_GENAI or HAS_GEMINI_LEGACY
+
+try:
+    from json_repair import repair_json
+    HAS_JSON_REPAIR = True
+except ImportError:
+    HAS_JSON_REPAIR = False
 
 try:
     import g4f
@@ -143,6 +163,17 @@ def clean_json_response(response_text):
     except:
         pass
         
+    # 3b. json-repair: conserta virgulas/aspas faltando e JSON truncado
+    if HAS_JSON_REPAIR:
+        try:
+            fixed = repair_json(response_text, return_objects=True)
+            if isinstance(fixed, list):
+                fixed = next((x for x in fixed if isinstance(x, dict) and "segments" in x), None)
+            if isinstance(fixed, dict) and isinstance(fixed.get("segments"), list):
+                return fixed
+        except Exception:
+            pass
+
     # 4. LAST RESORT: Fragment Parser (Para JSON truncado/incompleto)
     # Procura por "segments": [ e tenta parsear item por item
     try:
@@ -207,39 +238,217 @@ def preprocess_transcript_for_ai(segments):
 
     return full_text.strip()
 
-def call_gemini(prompt, api_key, model_name='gemini-flash-lite-latest'):
-    if not HAS_GEMINI:
-        raise ImportError("A biblioteca 'google-generativeai' não está instalada. Instale com: pip install google-generativeai")
-    
-    genai.configure(api_key=api_key)
-    # Usando modelo definido na config ou o padrão
-    model = genai.GenerativeModel(model_name) 
-    
-    max_retries = 5
-    base_wait = 30
+# --- Robustez das chamadas de IA ---
+AI_TIMEOUT_SECONDS = int(os.environ.get("VIRALCUTTER_AI_TIMEOUT", "180"))
+QUOTA_MAX_WAIT_SECONDS = 120          # cota "por minuto" com espera maior que isso e tratada como esgotada
+TRANSIENT_HTTP_CODES = {408, 500, 502, 503, 504, 529}
+AI_STATS = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0}
+_GEMINI_NO_THINKING = set()           # modelos que recusaram thinking_config nesta execucao
 
-    for attempt in range(max_retries):
+
+class AIQuotaError(RuntimeError):
+    """Cota da API esgotada (diaria, ou com espera longa demais para valer a pena aguardar)."""
+
+
+def parse_retry_seconds(text):
+    """Tempo de espera pedido pela API: 'retry in 6h7m47.2s', 'retry in 47s', retry_delay { seconds: 22067 }."""
+    text = re.sub(r"(\d+(?:\.\d+)?)ms\b", lambda m: f"{float(m.group(1)) / 1000:.3f}s", str(text or ""))
+    m = re.search(r"retry in\s+([\d.hms\s]+)", text, re.I)
+    if m:
+        total = sum(float(v) * {"h": 3600, "m": 60, "s": 1}[u] for v, u in re.findall(r"(\d+(?:\.\d+)?)([hms])", m.group(1)))
+        if total > 0:
+            return total
+    m = re.search(r"retry_?delay['\"]?\s*[:=]?\s*\{?\s*['\"]?seconds['\"]?\s*[:=]\s*['\"]?(\d+)", text, re.I)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s", text)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def is_daily_quota(text):
+    return bool(re.search(r"per\s*day|PerDay|daily", str(text or ""), re.I))
+
+
+def _fmt_wait(seconds):
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    return f"{h}h{rem // 60:02d}min" if h else f"{max(1, rem // 60)}min"
+
+
+def quota_message(provider, model, wait_seconds, daily):
+    kind = "diária" if daily else "por minuto"
+    when = f" Libera em ~{_fmt_wait(wait_seconds)}." if wait_seconds else ""
+    return (f"Cota {kind} da API esgotada ({provider}, modelo {model}).{when} "
+            f"Opções: usar outro modelo (ex.: gemini-flash-lite-latest), outro provedor "
+            f"(--ai-backend openai ou anthropic) ou esperar a cota liberar.")
+
+
+if HAS_GENAI:
+    from pydantic import BaseModel as _BaseModel
+
+    class _SegmentOut(_BaseModel):
+        start_text: str
+        end_text: str
+        start_time_ref: str
+        title: str
+        hook: str
+        reasoning: str
+        score: int
+
+    class _SegmentsOut(_BaseModel):
+        segments: list[_SegmentOut]
+
+    SEGMENTS_RESPONSE_SCHEMA = _SegmentsOut
+else:
+    SEGMENTS_RESPONSE_SCHEMA = None
+
+
+def _gemini_thinking_config(model_name):
+    """Raciocinio baixo por padrao (VIRALCUTTER_GEMINI_THINKING=minimal|low|medium|high|<orcamento>|default)."""
+    if not HAS_GENAI or model_name in _GEMINI_NO_THINKING:
+        return None
+    raw = os.environ.get("VIRALCUTTER_GEMINI_THINKING", "low").strip().lower()
+    if raw in ("", "default", "auto"):
+        return None
+    name = (model_name or "").lower()
+    if raw.isdigit():
+        return genai_types.ThinkingConfig(thinking_budget=int(raw))
+    if "1.5" in name or "2.0" in name:
+        return None  # modelos sem raciocinio
+    if "2.5" in name:
+        budget = {"minimal": 0, "low": 1024, "medium": 4096, "high": 8192}.get(raw, 1024)
+        if "pro" in name:
+            budget = max(budget, 128)  # o 2.5 pro nao aceita desligar o raciocinio
+        return genai_types.ThinkingConfig(thinking_budget=budget)
+    level = raw.upper() if raw.upper() in ("MINIMAL", "LOW", "MEDIUM", "HIGH") else "LOW"
+    return genai_types.ThinkingConfig(thinking_level=level)
+
+
+def _call_gemini_genai(prompt, api_key, model_name, response_schema=None):
+    client = google_genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(
+        timeout=AI_TIMEOUT_SECONDS * 1000, retry_options=genai_types.HttpRetryOptions(attempts=1)))
+    cfg = {"response_mime_type": "application/json"}
+    if response_schema is not None:
+        cfg["response_schema"] = response_schema
+    thinking = _gemini_thinking_config(model_name)
+    if thinking is not None:
+        cfg["thinking_config"] = thinking
+
+    max_attempts, attempt, timeouts = 5, 0, 0
+    while attempt < max_attempts:
+        attempt += 1
+        AI_STATS["requests"] += 1
+        t0 = time.time()
         try:
-            response = model.generate_content(prompt)
+            resp = client.models.generate_content(model=model_name, contents=prompt,
+                                                  config=genai_types.GenerateContentConfig(**cfg))
+        except genai_errors.APIError as e:
+            code = getattr(e, "code", 0) or 0
+            text = str(e)
+            if code == 429:
+                wait = parse_retry_seconds(text)
+                daily = is_daily_quota(text)
+                if daily or (wait and wait > QUOTA_MAX_WAIT_SECONDS):
+                    raise AIQuotaError(quota_message("Gemini", model_name, wait, daily))
+                wait = (wait + 2) if wait else 20 * attempt
+                print(f"[429] Limite por minuto do Gemini ({model_name}). Aguardando {wait:.0f}s "
+                      f"({attempt}/{max_attempts})...", flush=True)
+                time.sleep(wait)
+                continue
+            if code == 400 and "thinking" in text.lower() and "thinking_config" in cfg:
+                print(f"[IA] {model_name} não aceita configuração de raciocínio; repetindo sem ela.", flush=True)
+                cfg.pop("thinking_config")
+                _GEMINI_NO_THINKING.add(model_name)
+                attempt -= 1
+                continue
+            if code == 400 and "schema" in text.lower() and "response_schema" in cfg:
+                print(f"[IA] {model_name} recusou o esquema de resposta; repetindo só com JSON.", flush=True)
+                cfg.pop("response_schema")
+                attempt -= 1
+                continue
+            if code in TRANSIENT_HTTP_CODES:
+                wait = min(60, 5 * 2 ** (attempt - 1))
+                print(f"[{code}] Gemini indisponível no momento. Nova tentativa em {wait}s "
+                      f"({attempt}/{max_attempts})...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"Erro na API do Gemini (HTTP {code}): {getattr(e, 'message', None) or text[:300]}")
+            return "{}"
+        except Exception as e:
+            msg = str(e)
+            if "timed out" in msg.lower() or "timeout" in type(e).__name__.lower():
+                timeouts += 1
+                if timeouts >= 2:
+                    print(f"[IA] Gemini não respondeu em {AI_TIMEOUT_SECONDS}s (2 vezes). Desistindo deste trecho.", flush=True)
+                    return "{}"
+                print(f"[IA] Gemini não respondeu em {AI_TIMEOUT_SECONDS}s. Tentando de novo...", flush=True)
+                continue
+            print(f"Erro ao chamar o Gemini: {e}")
+            return "{}"
+
+        usage = getattr(resp, "usage_metadata", None)
+        if usage is not None:
+            t_in = getattr(usage, "prompt_token_count", 0) or 0
+            t_out = getattr(usage, "candidates_token_count", 0) or 0
+            t_think = getattr(usage, "thoughts_token_count", 0) or 0
+            AI_STATS["input_tokens"] += t_in
+            AI_STATS["output_tokens"] += t_out
+            AI_STATS["thinking_tokens"] += t_think
+            print(f"[IA] Gemini respondeu em {time.time() - t0:.1f}s | tokens: entrada {t_in}, "
+                  f"saída {t_out}, raciocínio {t_think}", flush=True)
+        try:
+            text = resp.text
+        except Exception:
+            text = None
+        if not text:
+            reason = None
+            try:
+                reason = resp.candidates[0].finish_reason
+            except Exception:
+                pass
+            print(f"[WARN] Resposta vazia do Gemini (motivo: {reason}).")
+            return "{}"
+        return text
+
+    print(f"Falha após {max_attempts} tentativas no Gemini.")
+    return "{}"
+
+
+def _call_gemini_legacy(prompt, api_key, model_name):
+    """SDK antigo (google-generativeai): so quando o google-genai nao esta instalado."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
+    max_retries = 5
+    for attempt in range(max_retries):
+        AI_STATS["requests"] += 1
+        try:
+            response = model.generate_content(prompt, request_options={"timeout": AI_TIMEOUT_SECONDS, "retry": None})
             return response.text
         except Exception as e:
             error_str = str(e)
-            if "429" in error_str or "Quota exceeded" in error_str:
-                wait_time = base_wait * (attempt + 1)
-                
-                match = re.search(r"retry in (\d+(\.\d+)?)s", error_str)
-                if match:
-                    wait_time = float(match.group(1)) + 5.0
-                
-                print(f"[429] Quota Exceeded. Waiting {wait_time:.2f}s before retry {attempt+1}/{max_retries}...", flush=True)
-                time.sleep(wait_time)
+            if "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in type(e).__name__:
+                wait = parse_retry_seconds(error_str)
+                daily = is_daily_quota(error_str)
+                if daily or (wait and wait > QUOTA_MAX_WAIT_SECONDS):
+                    raise AIQuotaError(quota_message("Gemini", model_name, wait, daily))
+                wait = (wait + 2) if wait else 30 * (attempt + 1)
+                print(f"[429] Limite por minuto do Gemini. Aguardando {wait:.0f}s ({attempt+1}/{max_retries})...", flush=True)
+                time.sleep(wait)
                 continue
-            else:
-                print(f"Erro na API do Gemini: {e}")
-                return "{}"
-    
+            print(f"Erro na API do Gemini: {e}")
+            return "{}"
     print("Falha após max retries no Gemini.")
     return "{}"
+
+
+def call_gemini(prompt, api_key, model_name='gemini-flash-lite-latest', response_schema=None):
+    if HAS_GENAI:
+        return _call_gemini_genai(prompt, api_key, model_name, response_schema)
+    if HAS_GEMINI_LEGACY:
+        return _call_gemini_legacy(prompt, api_key, model_name)
+    raise ImportError("Nenhum SDK do Gemini instalado. Instale com: pip install google-genai")
 
 def call_g4f(prompt, model_name=None):
     if not HAS_G4F:
@@ -252,6 +461,7 @@ def call_g4f(prompt, model_name=None):
     
     for attempt in range(max_retries):
         try:
+            AI_STATS["requests"] += 1
             response = g4f.ChatCompletion.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
@@ -310,7 +520,8 @@ def call_openai_compatible(prompt, api_key, model_name=None, base_url=None):
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=600)
+            AI_STATS["requests"] += 1
+            resp = requests.post(url, headers=headers, json=payload, timeout=AI_TIMEOUT_SECONDS)
         except requests.RequestException as e:
             wait_time = 5 * (attempt + 1)
             print(f"[WARN] Erro de conexão com {base_url} ({e}). Nova tentativa em {wait_time}s ({attempt+1}/{max_retries})...", flush=True)
@@ -353,6 +564,7 @@ def call_anthropic(prompt, api_key, model_name=None):
     try:
         # fallbacks="default": se o modelo recusar por politica de seguranca, a propria API
         # tenta de novo em um modelo alternativo dentro da mesma chamada.
+        AI_STATS["requests"] += 1
         response = client.beta.messages.create(
             model=model_name,
             max_tokens=16000,
@@ -466,6 +678,68 @@ def snap_end(start, desired_end, transcript_segments, min_duration, max_duration
     # Curto demais ou fim nao encontrado: primeiro fim de frase depois do minimo
     return min(s['end'] for s in pool), "depois-do-min"
 
+HOOK_MAX_WORDS = 10
+
+
+def _clean_text(text):
+    """Remove entidades HTML (&gt;&gt;) e marcadores de troca de falante (>>) vindos de legendas."""
+    import html
+    text = html.unescape(str(text or "")).replace(">>", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def final_hook(seg, start, end, transcript_segments):
+    """Texto curto do inicio do corte, diferente do titulo. Sem hook valido da IA, usa a 1a fala do trecho."""
+    title = (seg.get("title") or "").strip()
+    hook = _clean_text(seg.get("hook"))
+    if hook and hook.lower() != title.lower():
+        words = hook.split()
+        return " ".join(words[:HOOK_MAX_WORDS + 2])
+    text = _clean_text(" ".join((s.get("text") or "") for s in transcript_segments
+                                if start - 0.05 <= s["start"] < min(end, start + 10)))
+    words = text.split()
+    if not words:
+        return title
+    return " ".join(words[:HOOK_MAX_WORDS]) + ("..." if len(words) > HOOK_MAX_WORDS else "")
+
+
+def heuristic_segments(transcript_segments, count, min_duration, max_duration, heatmap=None):
+    """Reserva quando a IA nao devolve nenhum corte: janelas com mais 'mais repetidos' e mais fala."""
+    segs = transcript_segments or []
+    if not segs:
+        return {"segments": []}
+    target = (min_duration + max_duration) / 2.0
+    candidates, last_start = [], -1e9
+    for s in segs:
+        st = s["start"]
+        if st - last_start < 5.0:      # uma janela a cada ~5 s basta
+            continue
+        last_start = st
+        end, _ = snap_end(st, st + target, segs, min_duration, max_duration)
+        text = _clean_text(" ".join(x["text"] for x in segs if st <= x["start"] < end))
+        heat = heat_average(heatmap, st, end) if heatmap else None
+        density = len(text.split()) / max(1.0, end - st)
+        score = (100.0 * heat if heat is not None else 0.0) + 10.0 * density + 2.0 * (text.count("?") + text.count("!"))
+        candidates.append((score, st, end, text))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    chosen = []
+    for c in candidates:
+        if any(c[1] < o[2] and c[2] > o[1] for o in chosen):
+            continue
+        chosen.append(c)
+        if len(chosen) >= count:
+            break
+    out = []
+    for score, st, end, text in chosen:
+        words = text.split()
+        mm, ss = divmod(int(st), 60)
+        out.append({"title": f"Trecho {mm:02d}:{ss:02d}", "start_time": st, "end_time": end,
+                    "hook": " ".join(words[:HOOK_MAX_WORDS]) + ("..." if len(words) > HOOK_MAX_WORDS else ""),
+                    "reasoning": "heurística (a IA não devolveu cortes)", "score": int(min(100, score)),
+                    "duration": end - st})
+    return {"segments": out}
+
+
 def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None, heatmap=None):
     """
     Aligns raw AI segments (with reference tags) to actual transcript timestamps.
@@ -573,7 +847,7 @@ def process_segments(raw_segments, transcript_segments, min_duration, max_durati
                 "title": seg.get('title', 'Viral Segment'),
                 "start_time": final_start_time,
                 "end_time": final_end_time,
-                "hook": seg.get('title', ''), 
+                "hook": final_hook(seg, final_start_time, final_end_time, transcript_segments),
                 "reasoning": seg.get('reasoning', ''),
                 "score": seg.get('score', 0),
                 "duration": duration
@@ -796,6 +1070,8 @@ def select_chapters_by_theme(chapters, themes, ai_mode, api_key, model_name, bas
         nums = re.findall(r'\d+', m.group(1)) if m else []
         idx = sorted({int(i) for i in nums if 0 <= int(i) < len(chapters)})
         return idx or None
+    except AIQuotaError:
+        raise
     except Exception as e:
         print(f"[WARN] Filtro de capitulos falhou ({e}); usando todos.")
         return None
@@ -803,6 +1079,8 @@ def select_chapters_by_theme(chapters, themes, ai_mode, api_key, model_name, bas
 
 def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode="manual", api_key=None, project_folder="tmp", chunk_size_arg=None, model_name_arg=None, video_type="generic", base_url=None):
     quantidade_de_virals = num_segments
+    for k in AI_STATS:
+        AI_STATS[k] = 0
     if video_type not in VIDEO_TYPE_INSTRUCTIONS:
         print(f"[WARN] Tipo de vídeo desconhecido '{video_type}'. Usando 'generic'.")
         video_type = "generic"
@@ -899,6 +1177,7 @@ Task: {virality_instruction}
 Analyze the transcript below with time tags (XXs). Find {amount} viral segments.
 Constraints: Each segment MUST be between {min_duration} seconds and {max_duration} seconds.
 IMPORTANT: Output "Title", "Hook", and "Reasoning" in the SAME LANGUAGE as the transcript (e.g., if transcript is Portuguese, output Portuguese).
+The "hook" is the short on-screen text (max 10 words) shown at the start; it must be different from the title and describe this specific moment.
 TRANSCRIPT:
 {transcript_chunk}
 OUTPUT JSON ONLY:
@@ -912,8 +1191,9 @@ OUTPUT JSON ONLY:
                         "start_text": "Exact first 5-10 words of the segment",
                         "end_text": "Exact last 5-10 words of the segment",
                         "start_time_ref": "Value of closest (XXs) tag",
-                        "title": "Viral Hook Title (Same Language as Transcript)",
-                        "reasoning": "Why this is viral? Hook? Value? (Same Language as Transcript)",
+                        "title": "Catchy clip title, max ~60 characters (Same Language as Transcript)",
+                        "hook": "On-screen opening text, max 10 words, DIFFERENT from the title, about THIS moment (Same Language as Transcript)",
+                        "reasoning": "One short sentence: why this works (Same Language as Transcript)",
                         "score": 95
                     }
                 ]
@@ -944,6 +1224,8 @@ OUTPUT JSON ONLY:
         chunks = split_text(content, chunk_size)
     if peaks:
         print(f"YouTube 'mais repetidos': {len(peaks)} pico(s) marcados para a IA.")
+    if ai_mode in ("gemini", "openai", "anthropic", "g4f"):
+        print(f"[IA] {len(chunks)} requisição(ões) para escolher os cortes (modelo: {model_name or 'padrão'}).")
 
     if viral_mode or not (themes or "").strip():
         virality_instruction = f"identify the {quantidade_de_virals} segments with the highest viral potential"
@@ -1080,7 +1362,8 @@ OUTPUT JSON ONLY:
 
         elif ai_mode == "gemini":
             print(f"Enviando chunk {i+1} para o Gemini (Model: {model_name})...")
-            response_text = call_gemini(prompt, api_key, model_name=model_name)
+            response_text = call_gemini(prompt, api_key, model_name=model_name,
+                                        response_schema=SEGMENTS_RESPONSE_SCHEMA)
         elif ai_mode == "g4f":
             print(f"Enviando chunk {i+1} para o G4F (Model: {model_name})...")
             response_text = call_g4f(prompt, model_name=model_name)
@@ -1116,13 +1399,19 @@ OUTPUT JSON ONLY:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_ask, i, pr): i for i, pr in enumerate(output_texts)}
+            quota_error = None
             for fut in futures:
                 i = futures[fut]
                 try:
                     responses[i] = fut.result()
+                except AIQuotaError as e:
+                    quota_error = quota_error or e
+                    responses[i] = ""
                 except Exception as e:
                     print(f"Erro no chunk {i+1}: {e}")
                     responses[i] = ""
+        if quota_error:
+            raise quota_error
     else:
         for i, pr in enumerate(output_texts):
             responses[i] = _ask(i, pr)
@@ -1149,8 +1438,12 @@ OUTPUT JSON ONLY:
         except Exception as e:
             print(f"Erro desconhecido ao processar chunk: {e}")
 
+    if AI_STATS["requests"]:
+        print(f"[IA] Requisições nesta rodada: {AI_STATS['requests']} | tokens: entrada {AI_STATS['input_tokens']}, "
+              f"saída {AI_STATS['output_tokens']}, raciocínio {AI_STATS['thinking_tokens']}", flush=True)
+
     # Call the alignment / processing logic
-    return process_segments(
+    result = process_segments(
         all_raw_segments, 
         transcript_segments, 
         tempo_minimo, 
@@ -1158,3 +1451,8 @@ OUTPUT JSON ONLY:
         output_count=quantidade_de_virals,
         heatmap=heatmap
     )
+    if not result.get("segments") and ai_mode != "manual":
+        print("[WARN] A IA não devolveu nenhum corte aproveitável. Usando a heurística de reserva "
+              "('mais repetidos' + densidade de fala). Revise os cortes.", flush=True)
+        result = heuristic_segments(transcript_segments, quantidade_de_virals, tempo_minimo, tempo_maximo, heatmap)
+    return result
