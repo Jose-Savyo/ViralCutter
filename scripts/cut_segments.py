@@ -1,16 +1,22 @@
 from scripts import cut_json
+from scripts import edit_pauses
 import os
 import subprocess
 import json
 
-def cut(segments, project_folder="tmp", skip_video=False):
+def cut(segments, project_folder="tmp", skip_video=False, remove_pauses=False, remove_fillers=False):
 
     def check_nvenc_support():
-        # ... (unchanged)
+        """NVENC listado nao basta (ex.: ffmpeg com NVENC numa maquina sem NVIDIA): testa um encode curto."""
         try:
-            result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
-            return "h264_nvenc" in result.stdout
-        except subprocess.CalledProcessError:
+            result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
+            if "h264_nvenc" not in result.stdout:
+                return False
+            test = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                   "-i", "color=c=black:s=256x256:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                                  capture_output=True, timeout=30)
+            return test.returncode == 0
+        except Exception:
             return False
 
     def generate_segments(response, project_folder, skip_video):
@@ -43,6 +49,9 @@ def cut(segments, project_folder="tmp", skip_video=False):
         input_json_path = os.path.join(project_folder, "input.json")
 
         segments = response.get("segments", [])
+        words = edit_pauses.load_words(project_folder) if (remove_pauses or remove_fillers) else []
+        if (remove_pauses or remove_fillers) and not words:
+            print("Remoção de pausas/vícios: sem palavras com tempo no input.json; os cortes ficam sem essa edição.")
         for i, segment in enumerate(segments):
             start_time = segment.get("start_time", "00:00:00")
             duration = segment.get("duration", 0)
@@ -105,7 +114,16 @@ def cut(segments, project_folder="tmp", skip_video=False):
             # print(f"Executing command: {' '.join(command)}")
 
             # VIDEO GENERATION
+            removals_path = os.path.join(cuts_folder, f"{base_name}_removals.json")
+            removals = []
             if not skip_video:
+                if words and duration_seconds:
+                    removals = edit_pauses.plan_removals(words, start_time_seconds, start_time_seconds + float(duration_seconds),
+                                                         input_file, remove_pauses=remove_pauses, remove_fillers=remove_fillers)
+                    if removals:
+                        print(f"Pausas/vícios: {len(removals)} trecho(s), {sum(b - a for a, b in removals):.1f}s removidos")
+                with open(removals_path, "w", encoding="utf-8") as rf:
+                    json.dump(removals, rf)
                 # Comando ffmpeg
                 command = [
                     "ffmpeg",
@@ -114,8 +132,11 @@ def cut(segments, project_folder="tmp", skip_video=False):
                     "-ss", start_time_str,
                     "-i", input_file,
                     "-t", duration_str,
-                    "-c:v", video_codec
                 ]
+                if removals:
+                    vf, af = edit_pauses.select_filters(edit_pauses.keep_intervals(removals, float(duration_seconds)))
+                    command.extend(["-vf", vf, "-af", af])
+                command.extend(["-c:v", video_codec])
 
                 if video_codec == "h264_nvenc":
                     command.extend([
@@ -152,6 +173,18 @@ def cut(segments, project_folder="tmp", skip_video=False):
             json_output_path = os.path.join(subs_folder, json_output_filename)
             
             cut_json.cut_json_transcript(input_json_path, json_output_path, start_time_seconds, end_time_seconds)
+            # Cortes com pausas/vicios removidos: remapeia os tempos da legenda para a nova linha do tempo
+            if skip_video and os.path.exists(removals_path):
+                try:
+                    with open(removals_path, "r", encoding="utf-8") as rf:
+                        removals = [tuple(r) for r in json.load(rf)]
+                except Exception:
+                    removals = []
+            if removals and os.path.exists(json_output_path):
+                with open(json_output_path, "r", encoding="utf-8") as jf:
+                    sub_data = json.load(jf)
+                with open(json_output_path, "w", encoding="utf-8") as jf:
+                    json.dump(edit_pauses.remap_subtitle_json(sub_data, removals), jf, indent=2, ensure_ascii=False)
             # --------------------
 
             print("\n" + "="*50 + "\n")

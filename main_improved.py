@@ -102,13 +102,13 @@ def interactive_input_int(prompt_text):
 # Enquadramento padrao por tipo de video. So preenche o que o usuario nao passou na CLI.
 # (As instrucoes para a IA por tipo ficam em create_viral_segments.VIDEO_TYPE_INSTRUCTIONS.)
 VIDEO_TYPE_PRESETS = {
-    "generic":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "normal"},
-    "podcast":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm"},
-    "entrevista": {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm"},
-    "react":      {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal"},
-    "vlog":       {"frame_layout": "crop",      "face_mode": "1",    "camera_style": "dynamic"},
-    "gameplay":   {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal"},
-    "aula":       {"frame_layout": "fit-blur",  "face_mode": "1",    "camera_style": "calm"},
+    "generic":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "normal",  "punch_in": "off", "remove_pauses": "off"},
+    "podcast":    {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm",    "punch_in": "on",  "remove_pauses": "on"},
+    "entrevista": {"frame_layout": "crop",      "face_mode": "auto", "camera_style": "calm",    "punch_in": "on",  "remove_pauses": "off"},
+    "react":      {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal",  "punch_in": "off", "remove_pauses": "off"},
+    "vlog":       {"frame_layout": "crop",      "face_mode": "1",    "camera_style": "dynamic", "punch_in": "off", "remove_pauses": "off"},
+    "gameplay":   {"frame_layout": "fit-faces", "face_mode": "auto", "camera_style": "normal",  "punch_in": "off", "remove_pauses": "off"},
+    "aula":       {"frame_layout": "fit-blur",  "face_mode": "1",    "camera_style": "calm",    "punch_in": "on",  "remove_pauses": "on"},
 }
 
 def apply_video_type_preset(args):
@@ -117,7 +117,7 @@ def apply_video_type_preset(args):
         if getattr(args, key) is None:
             setattr(args, key, value)
     print(i18n("Video type: {} | Frame layout: {} | Face mode: {}").format(args.video_type, args.frame_layout, args.face_mode))
-    print(f"Camera: {args.camera_style}")
+    print(f"Camera: {args.camera_style} | Punch-in: {args.punch_in} | Remove pauses: {args.remove_pauses} | Remove fillers: {args.remove_fillers}")
 
 def main():
     # Configuração de Argumentos via Linha de Comando (CLI)
@@ -145,6 +145,9 @@ def main():
     parser.add_argument("--workflow", choices=["1", "2", "3"], default="1", help="Workflow choice: 1=Full, 2=Cut Only, 3=Subtitles Only")
     parser.add_argument("--face-model", choices=["insightface", "mediapipe"], default="insightface", help="Face detection model")
     parser.add_argument("--face-mode", choices=["auto", "1", "2"], default=None, help="Face tracking mode: auto, 1, 2 (default: from --video-type)")
+    parser.add_argument("--punch-in", choices=["on", "off"], default=None, help="Short emphasis zoom on speech peaks (crop layout). Default: from --video-type")
+    parser.add_argument("--remove-pauses", choices=["on", "off"], default=None, help="Shorten long pauses when the gap is silent and visually still. Default: from --video-type")
+    parser.add_argument("--remove-fillers", action="store_true", help="Experimental: remove hesitations (eh, hum, ahn) inside the cuts")
     parser.add_argument("--parallel-clips", default="auto", help="How many cuts to frame at the same time: auto (2 on GPU, 1 on CPU) or a number")
     parser.add_argument("--camera-style", choices=list(edit_video.CAMERA_STYLES), default=None, help="Virtual camera: calm (holds longer), normal, dynamic (follows faster). Default: from --video-type")
     parser.add_argument("--frame-layout", choices=list(edit_video.FRAME_LAYOUTS), default=None, help="crop = 9:16 crop following faces; fit-blur = full video centered over blurred background; fit-faces = full video centered with face zooms above/below (default: from --video-type)")
@@ -603,7 +606,8 @@ def main():
             else:
                 print(i18n("Cutting segments..."))
 
-            cut_segments.cut(viral_segments, project_folder=project_folder, skip_video=skip_cutting)
+            cut_segments.cut(viral_segments, project_folder=project_folder, skip_video=skip_cutting,
+                             remove_pauses=(args.remove_pauses == "on"), remove_fillers=args.remove_fillers)
         
         # 5. Workflow Check
         if workflow_choice == "2":
@@ -643,6 +647,7 @@ def main():
                 no_face_mode=args.no_face_mode,
                 frame_layout=args.frame_layout,
                 camera_style=args.camera_style,
+                punch_in=(args.punch_in == "on"),
                 parallel_clips=args.parallel_clips
             )
 
@@ -758,6 +763,9 @@ def main():
                 "face_config": {
                     "frame_layout": args.frame_layout,
                     "camera_style": args.camera_style,
+                    "punch_in": args.punch_in,
+                    "remove_pauses": args.remove_pauses,
+                    "remove_fillers": args.remove_fillers,
                     "parallel_clips": args.parallel_clips,
                     "model": face_model,
                     "mode": face_mode,

@@ -617,7 +617,7 @@ def generate_short_haar(input_file, output_file, index, project_folder, final_fo
 
     finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
-def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding", frame_layout="crop", camera_style="normal"):
+def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding", frame_layout="crop", camera_style="normal", punch_in=False):
     """Face detection using InsightFace (SOTA)."""
     print(f"Processing (InsightFace): {input_file} | Mode: {face_mode} | Layout: {frame_layout}")
     
@@ -654,6 +654,14 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     transition_frames = []
     # Camera virtual v2 (zona de conforto, confirmacao de salto, mola, corte seco na troca de pessoa)
     rig = CameraRig(frame_width, frame_height, fps, camera_style, dead_zone)
+    # Punch-in: zoom curto de enfase nos picos da fala (so no recorte de 1 rosto)
+    zooms = None
+    punch_block_until = -1
+    if punch_in and fps:
+        from scripts.punch_in import emphasis_times, zoom_curve
+        beats = emphasis_times(input_file, total_frames / fps)
+        zooms = zoom_curve(total_frames, fps, beats)
+        print(f"Punch-in: {len(beats)} zoom(s) em {[round(t, 1) for t in beats]} s")
 
     # Current state of face mode (1 or 2)
     # If auto, we decide per detection interval
@@ -719,6 +727,12 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             faces_activity_state = []
             fit_scene_reset = True
             rig.reset(frame_index / fps)
+            if zooms is not None and frame_index < len(zooms) and zooms[frame_index] > 1.0:
+                # zoom nao atravessa troca de cena: cancela o restante deste punch-in
+                j = frame_index
+                while j < len(zooms) and zooms[j] > 1.0:
+                    j += 1
+                punch_block_until = j
         prev_hist = cur_hist
 
         if frame_index >= next_detection_frame and len(transition_frames) == 0:
@@ -1180,7 +1194,10 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
              # 1 face
              # current_faces[0] is [x1, y1, x2, y2]
              fx1, fy1, fx2, fy2 = [float(v) for v in current_faces[0][:4]]
-             crop_log = crop_window(frame_width, frame_height, (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0)
+             zoom = 1.0
+             if zooms is not None and punch_block_until <= frame_index < len(zooms):
+                 zoom = float(zooms[frame_index])
+             crop_log = crop_window(frame_width, frame_height, (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, zoom=zoom)
              result = subpixel_crop_resize(frame, *crop_log, 1080, 1920)
              timeline_frames.append((frame_index, "1"))
              
@@ -1401,7 +1418,7 @@ def _frame_clip_worker(job):
     return index, mode, list(CLIP_TIMINGS)
 
 
-def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop", camera_style="normal", parallel_clips="auto"):
+def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop", camera_style="normal", parallel_clips="auto", punch_in=False):
     CLIP_TIMINGS.clear()
     if frame_layout not in FRAME_LAYOUTS:
         print(f"WARNING: Unknown frame_layout '{frame_layout}'. Using 'crop'.")
@@ -1487,7 +1504,7 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
                           include_motion=include_motion, active_speaker_motion_deadzone=active_speaker_motion_deadzone,
                           active_speaker_motion_sensitivity=active_speaker_motion_sensitivity,
                           active_speaker_decay=active_speaker_decay, no_face_mode=no_face_mode,
-                          frame_layout=frame_layout, camera_style=camera_style)
+                          frame_layout=frame_layout, camera_style=camera_style, punch_in=punch_in)
         opts = {"frame_layout": frame_layout, "no_face_mode": no_face_mode,
                 "focus_active_speaker": focus_active_speaker, "gen_kwargs": gen_kwargs}
         jobs, names = [], {}
@@ -1535,7 +1552,7 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
                                                      active_speaker_motion_deadzone=active_speaker_motion_deadzone,
                                                      active_speaker_motion_sensitivity=active_speaker_motion_sensitivity,
                                                      active_speaker_decay=active_speaker_decay,
-                                                     no_face_mode=no_face_mode, frame_layout=frame_layout, camera_style=camera_style)
+                                                     no_face_mode=no_face_mode, frame_layout=frame_layout, camera_style=camera_style, punch_in=punch_in)
                     if res: detected_mode = res
                     if frame_layout == "fit-faces":
                         detected_mode = "1"  # legenda na posicao padrao
