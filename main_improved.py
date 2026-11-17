@@ -26,6 +26,7 @@ from scripts import (
     organize_output,
     translate_json,
 )
+from scripts.stage_timer import StageTimer
 from i18n.i18n import I18nAuto
 
 # Inicializa sistema de tradução
@@ -449,6 +450,8 @@ def main():
 
     # Pipeline Execution
     try:
+        TIMER = StageTimer()
+        TIMER.start("download")
         # 1. Download & Project Setup
         print(f"DEBUG: Checking input_video state. input_video={input_video}")
         
@@ -476,6 +479,7 @@ def main():
             
         print(f"Project Folder: {project_folder}")
         
+        TIMER.start("transcricao")
         # 2. Transcribe
         if workflow_choice == "3":
             print(i18n("Workflow 3: Skipping Transcribe."))
@@ -487,6 +491,7 @@ def main():
             # Se skip config, args.model é default
             srt_file, tsv_file = transcribe_video.transcribe(input_video, args.model, project_folder=project_folder, batch_size=args.whisper_batch_size)
  
+        TIMER.start("ia_cortes")
         # 3. Create Viral Segments
         if workflow_choice != "3":
             # Se não carregamos 'viral_segments' lá em cima (ou se era download novo), checamos agora ou criamos
@@ -563,6 +568,7 @@ def main():
                           print(i18n("Failed to align raw segments: {}").format(e))
                           # If alignment fails, it might crash later, but we tried. 
 
+        TIMER.start("corte")
         # 4. Cut Segments
         # Se workflow for 3, pulamos corte
         if workflow_choice == "3":
@@ -594,9 +600,11 @@ def main():
         # 5. Workflow Check
         if workflow_choice == "2":
             print(i18n("Cut Only selected. Skipping Face Crop and Subtitles."))
+            TIMER.report(project_folder)
             print(i18n(f"Process completed! Check your results in: {project_folder}"))
             sys.exit(0)
 
+        TIMER.start("enquadramento")
         # 5. Edit Video (Face Crop)
         if workflow_choice != "3":
             print(i18n("Editing video with {} (Mode: {})...").format(face_model, face_mode))
@@ -669,6 +677,7 @@ def main():
                          os.rename(old_tl_path, new_tl_path)
                          print(f"Renamed (Workflow 3): {old_tl_name} -> {new_base_name}_timeline.json")
 
+        TIMER.start("legendas")
         # 6. Subtitles
         burn_subtitles_option = True 
         if burn_subtitles_option:
@@ -767,6 +776,7 @@ def main():
             print(i18n("Error saving configuration JSON: {}").format(e))
         # -------------------------------------
 
+        TIMER.report(project_folder)
         print(i18n("Process completed! Check your results in: {}").format(project_folder))
 
     except Exception as e:

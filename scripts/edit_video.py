@@ -5,6 +5,7 @@ import subprocess
 import mediapipe as mp
 from scripts.one_face import crop_and_resize_single_face, resize_with_padding, detect_face_or_body, crop_center_zoom, compose_fit_blur, compose_fit_faces
 from scripts.two_face import crop_and_resize_two_faces, detect_face_or_body_two_faces
+from scripts.stage_timer import ClipTimer, save_clip_timings
 try:
     from scripts.face_detection_insightface import init_insightface, detect_faces_insightface, crop_and_resize_insightface
     INSIGHTFACE_AVAILABLE = True
@@ -15,6 +16,7 @@ except ImportError:
 
 # Global cache for encoder
 CACHED_ENCODER = None
+CLIP_TIMINGS = []  # tempos por corte da ultima chamada de edit()
 
 def _encoder_works(encoder_name, preset):
     """Codifica alguns quadros de teste: o ffmpeg listar o encoder nao garante que exista o hardware."""
@@ -179,6 +181,8 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ct = ClipTimer(f"Corte {index}", (total_frames / fps) if fps else 0)
     
     # Target dimensions (9:16)
     
@@ -209,7 +213,8 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
     process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
     while True:
-        ret, frame = cap.read()
+        with ct.measure("leitura"):
+            ret, frame = cap.read()
         if not ret:
             break
 
@@ -217,7 +222,8 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
 
         try:
             # Write raw bytes to ffmpeg stdin
-            process.stdin.write(result.tobytes())
+            with ct.measure("escrita"):
+                process.stdin.write(result.tobytes())
         except Exception as e:
             print(f"Error writing frame to ffmpeg pipe: {e}")
             pass
@@ -228,7 +234,9 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
     process.stdin.close()
     process.wait()
     
-    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+    with ct.measure("mux"):
+        finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+    CLIP_TIMINGS.append(ct.finish())
 
 def finalize_video(input_file, output_file, index, fps, project_folder, final_folder):
     """Mux audio and video."""
@@ -554,6 +562,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ct = ClipTimer(f"Corte {index}", (total_frames / fps) if fps else 0)
     
     # Using mp4v for container, but final mux will fix encoding
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -620,7 +629,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
              ret = True
              buffered_frame = None
         else:
-             ret, frame = cap.read()
+             with ct.measure("leitura"):
+                 ret, frame = cap.read()
 
         if not ret or frame is None:
             break
@@ -643,7 +653,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
 
         if frame_index >= next_detection_frame and len(transition_frames) == 0:
             # Detect faces
-            faces = detect_faces_insightface(frame)
+            with ct.measure("deteccao"):
+                faces = detect_faces_insightface(frame)
             if faces:
                 scores = [f"{f.get('det_score',0):.2f}" for f in faces]
                 print(f"DEBUG: Frame {frame_index} | Raw Faces: {len(faces)} | Scores: {scores}")
@@ -905,9 +916,11 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
             # But DO NOT look ahead if we are in Crowd Mode (we explicitly wanted 0 faces)
             if len(faces) < target_faces and not is_crowd:
                 # Try 1 frame ahead
-                ret2, frame2 = cap.read()
+                with ct.measure("leitura"):
+                    ret2, frame2 = cap.read()
                 if ret2 and frame2 is not None:
-                     faces2 = detect_faces_insightface(frame2)
+                     with ct.measure("deteccao"):
+                         faces2 = detect_faces_insightface(frame2)
                      
                      # --- Apply same filtering to lookahead ---
                      valid_faces2 = []
@@ -1083,7 +1096,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         else:
             # Fallback for this frame
             result = render_no_face(frame, frame_layout, no_face_mode)
-            out.write(result)
+            with ct.measure("escrita"):
+                out.write(result)
             timeline_frames.append((frame_index, "1")) # Fix: Ensure fallback is treated as single face for subs
             
             # Fix XML Log sync (Empty faces for fallback)
@@ -1176,10 +1190,12 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         except: pass
         coordinate_log.append(coords_entry)
 
-        out.write(result)
+        with ct.measure("escrita"):
+            out.write(result)
 
     cap.release()
-    out.release()
+    with ct.measure("escrita"):
+        out.release()
     
     # Compress timeline into segments
     # [(start_time, end_time, mode), ...]
@@ -1231,7 +1247,9 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
         print(f"Error saving coords: {e}")
 
     print(f"Summary: {scene_cut_count} scene cut(s) | 1-face frames: {frame_1_face_count} | 2-face frames: {frame_2_face_count} | fit-faces->crop frames: {fit_crop_frames} | total: {total_frames}")
-    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+    with ct.measure("mux"):
+        finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+    CLIP_TIMINGS.append(ct.finish())
 
     # Return dominant mode logic (or keep 15% rule as overall fallback)
     if frame_2_face_count > (total_frames * 0.15):
@@ -1240,6 +1258,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
 
 
 def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop"):
+    CLIP_TIMINGS.clear()
     if frame_layout not in FRAME_LAYOUTS:
         print(f"WARNING: Unknown frame_layout '{frame_layout}'. Using 'crop'.")
         frame_layout = "crop"
@@ -1476,6 +1495,8 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
         print(f"Detect Stats saved: {modes_file}")
     except Exception as e:
         print(f"Error saving face modes: {e}")
+
+    save_clip_timings(project_folder, CLIP_TIMINGS)
 
 if __name__ == "__main__":
     edit()
