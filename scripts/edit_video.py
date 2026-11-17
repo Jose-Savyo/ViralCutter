@@ -1283,7 +1283,125 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     return "1"
 
 
-def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop", camera_style="normal"):
+
+def clip_paths(input_file, final_folder, segments_data=None):
+    """(indice, arquivo temporario de video, nome final pelo titulo) de um corte."""
+    input_filename = os.path.basename(input_file)
+    index = 0
+    try:
+        parts = input_filename.split('_')
+        if parts[0].isdigit():
+            index = int(parts[0])
+        elif input_filename.startswith("output"):  # output000
+            idx_str = input_filename[6:9]
+            if idx_str.isdigit():
+                index = int(idx_str)
+    except Exception:
+        pass
+    output_file = os.path.join(final_folder, f"temp_video_no_audio_{index}.mp4")
+    base_name_final = input_filename.replace("_original_scale.mp4", "")
+    if input_filename.startswith("output") and segments_data and index < len(segments_data):
+        title = segments_data[index].get("title", f"Segment_{index}")
+        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"]).strip().replace(" ", "_")[:60]
+        base_name_final = f"{index:03d}_{safe_title}"
+    return index, output_file, base_name_final
+
+
+def rename_outputs(index, base_name_final, project_folder, final_folder):
+    """Renomeia saidas do corte (mp4, legenda, timeline, coords) para o titulo."""
+    try:
+        new_mp4_name = f"{base_name_final}.mp4"
+        new_mp4_path = os.path.join(final_folder, new_mp4_name)
+        
+        # Source is what finalize_video created
+        # finalize_video creates `final-output{index}_processed.mp4`
+        generated_mp4_name = f"final-output{str(index).zfill(3)}_processed.mp4"
+        generated_mp4_path = os.path.join(final_folder, generated_mp4_name)
+        
+        # 1. Rename MP4
+        if os.path.exists(generated_mp4_path):
+            if os.path.exists(new_mp4_path): os.remove(new_mp4_path)
+            os.rename(generated_mp4_path, new_mp4_path)
+            print(f"Renamed Output to Title: {new_mp4_name}")
+            
+            # 2. Rename JSON Subtitle (if exists and hasn't been renamed by cut_segments)
+            subs_folder = os.path.join(project_folder, "subs")
+            
+            # Check if legacy name exists
+            old_json_name = f"final-output{str(index).zfill(3)}_processed.json"
+            old_json_path = os.path.join(subs_folder, old_json_name)
+            
+            new_json_name = f"{base_name_final}_processed.json"
+            new_json_path = os.path.join(subs_folder, new_json_name)
+            
+            if os.path.exists(old_json_path):
+                if os.path.exists(new_json_path): os.remove(new_json_path)
+                os.rename(old_json_path, new_json_path)
+                print(f"Renamed Subtitles to Title: {new_json_name}")
+                
+            # 3. Rename Timeline JSON
+            # Timeline is temp_video_no_audio_{index}_timeline.json (created by generate_short...)
+            old_timeline_name = f"temp_video_no_audio_{index}_timeline.json"
+            old_timeline_path = os.path.join(final_folder, old_timeline_name)
+            
+            new_timeline_name = f"{base_name_final}_timeline.json"
+            new_timeline_path = os.path.join(final_folder, new_timeline_name)
+            
+            if os.path.exists(old_timeline_path):
+                if os.path.exists(new_timeline_path): os.remove(new_timeline_path)
+                os.rename(old_timeline_path, new_timeline_path)
+                print(f"Renamed Timeline to Title: {new_timeline_name}")
+                
+            # 4. Rename Coords JSON
+            old_coords_name = f"temp_video_no_audio_{index}_coords.json"
+            old_coords_path = os.path.join(final_folder, old_coords_name)
+            
+            new_coords_name = f"{base_name_final}_coords.json"
+            new_coords_path = os.path.join(final_folder, new_coords_name)
+            
+            if os.path.exists(old_coords_path):
+                if os.path.exists(new_coords_path): os.remove(new_coords_path)
+                os.rename(old_coords_path, new_coords_path)
+                print(f"Renamed Coords to Title: {new_coords_name}")
+                
+    except Exception as e:
+        print(f"Warning: Could not rename file with title: {e}")
+
+
+def resolve_parallel_clips(value, n_clips):
+    """'auto' = 2 cortes ao mesmo tempo com GPU (CUDA no onnxruntime), 1 na CPU; ou um numero."""
+    if n_clips <= 1:
+        return 1
+    if value in (None, "", "auto"):
+        try:
+            import onnxruntime as ort
+            n = 2 if "CUDAExecutionProvider" in ort.get_available_providers() else 1
+        except Exception:
+            n = 1
+    else:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            n = 1
+    return max(1, min(n, n_clips))
+
+
+def _frame_clip_worker(job):
+    """Roda num processo separado: enquadra um corte (InsightFace ou fit-blur)."""
+    input_file, output_file, index, project_folder, final_folder, opts = job
+    cv2.setNumThreads(1)  # varios processos: evita disputar os nucleos dentro de cada um
+    CLIP_TIMINGS.clear()
+    if opts["frame_layout"] == "fit-blur":
+        generate_short_fallback(input_file, output_file, index, project_folder, final_folder,
+                                no_face_mode=opts["no_face_mode"], frame_layout="fit-blur")
+        return index, "1", list(CLIP_TIMINGS)
+    init_insightface(with_landmarks=opts["focus_active_speaker"])
+    res = generate_short_insightface(input_file, output_file, index, project_folder, final_folder, **opts["gen_kwargs"])
+    mode = "1" if opts["frame_layout"] == "fit-faces" else (res or "1")
+    return index, mode, list(CLIP_TIMINGS)
+
+
+def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=10, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding", frame_layout="crop", camera_style="normal", parallel_clips="auto"):
     CLIP_TIMINGS.clear()
     if frame_layout not in FRAME_LAYOUTS:
         print(f"WARNING: Unknown frame_layout '{frame_layout}'. Using 'crop'.")
@@ -1356,28 +1474,46 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
         # Try finding lookahead in case listdir failed? No, glob is fine.
         return
 
+    # Cortes em paralelo (InsightFace ou fit-blur): um processo por corte
+    n_parallel = resolve_parallel_clips(parallel_clips, len(found_files))
+    if n_parallel > 1 and (frame_layout == "fit-blur" or insightface_working):
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        print(f"Enquadrando {len(found_files)} cortes, {n_parallel} ao mesmo tempo...")
+        gen_kwargs = dict(face_mode=face_mode, detection_period=detection_period, filter_threshold=filter_threshold,
+                          two_face_threshold=two_face_threshold, confidence_threshold=confidence_threshold,
+                          dead_zone=dead_zone, focus_active_speaker=focus_active_speaker,
+                          active_speaker_mar=active_speaker_mar, active_speaker_score_diff=active_speaker_score_diff,
+                          include_motion=include_motion, active_speaker_motion_deadzone=active_speaker_motion_deadzone,
+                          active_speaker_motion_sensitivity=active_speaker_motion_sensitivity,
+                          active_speaker_decay=active_speaker_decay, no_face_mode=no_face_mode,
+                          frame_layout=frame_layout, camera_style=camera_style)
+        opts = {"frame_layout": frame_layout, "no_face_mode": no_face_mode,
+                "focus_active_speaker": focus_active_speaker, "gen_kwargs": gen_kwargs}
+        jobs, names = [], {}
+        for input_file in found_files:
+            index, output_file, base_name_final = clip_paths(input_file, final_folder, segments_data)
+            names[index] = base_name_final
+            jobs.append((input_file, output_file, index, project_folder, final_folder, opts))
+        failed = []
+        with ProcessPoolExecutor(max_workers=n_parallel, mp_context=multiprocessing.get_context("spawn")) as pool:
+            futures = {pool.submit(_frame_clip_worker, job): job for job in jobs}
+            for fut in as_completed(futures):
+                job = futures[fut]
+                try:
+                    index, mode, timings = fut.result()
+                except Exception as e:
+                    print(f"Corte {job[2]}: falhou no processamento paralelo ({e}). Refazendo sozinho.")
+                    failed.append(job[0])
+                    continue
+                CLIP_TIMINGS.extend(timings)
+                face_modes_log[f"output{str(index).zfill(3)}"] = mode
+                rename_outputs(index, names[index], project_folder, final_folder)
+        found_files = failed  # os que falharam seguem pelo caminho normal, com todos os fallbacks
+
     for input_file in found_files:
         input_filename = os.path.basename(input_file)
-        
-        # Extract Index
-        index = 0
-        try:
-             parts = input_filename.split('_')
-             if parts[0].isdigit(): index = int(parts[0])
-             elif input_filename.startswith("output"): # output000
-                 idx_str = input_filename[6:9]
-                 if idx_str.isdigit(): index = int(idx_str)
-        except: pass
-        
-        output_file = os.path.join(final_folder, f"temp_video_no_audio_{index}.mp4")
-
-        # Determine Final Name (Title)
-        base_name_final = input_filename.replace("_original_scale.mp4", "")
-        # If legacy name, try to improve it
-        if input_filename.startswith("output") and segments_data and index < len(segments_data):
-             title = segments_data[index].get("title", f"Segment_{index}")
-             safe_title = "".join([c for c in title if c.isalnum() or c in " _-"]).strip().replace(" ", "_")[:60]
-             base_name_final = f"{index:03d}_{safe_title}"
+        index, output_file, base_name_final = clip_paths(input_file, final_folder, segments_data)
 
         if os.path.exists(input_file):
             success = False
@@ -1454,64 +1590,8 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
             face_modes_log[f"output{str(index).zfill(3)}"] = detected_mode
 
         if success:
-             try:
-                 new_mp4_name = f"{base_name_final}.mp4"
-                 new_mp4_path = os.path.join(final_folder, new_mp4_name)
-                 
-                 # Source is what finalize_video created
-                 # finalize_video creates `final-output{index}_processed.mp4`
-                 generated_mp4_name = f"final-output{str(index).zfill(3)}_processed.mp4"
-                 generated_mp4_path = os.path.join(final_folder, generated_mp4_name)
-                 
-                 # 1. Rename MP4
-                 if os.path.exists(generated_mp4_path):
-                     if os.path.exists(new_mp4_path): os.remove(new_mp4_path)
-                     os.rename(generated_mp4_path, new_mp4_path)
-                     print(f"Renamed Output to Title: {new_mp4_name}")
-                     
-                     # 2. Rename JSON Subtitle (if exists and hasn't been renamed by cut_segments)
-                     subs_folder = os.path.join(project_folder, "subs")
-                     
-                     # Check if legacy name exists
-                     old_json_name = f"final-output{str(index).zfill(3)}_processed.json"
-                     old_json_path = os.path.join(subs_folder, old_json_name)
-                     
-                     new_json_name = f"{base_name_final}_processed.json"
-                     new_json_path = os.path.join(subs_folder, new_json_name)
-                     
-                     if os.path.exists(old_json_path):
-                         if os.path.exists(new_json_path): os.remove(new_json_path)
-                         os.rename(old_json_path, new_json_path)
-                         print(f"Renamed Subtitles to Title: {new_json_name}")
-                         
-                     # 3. Rename Timeline JSON
-                     # Timeline is temp_video_no_audio_{index}_timeline.json (created by generate_short...)
-                     old_timeline_name = f"temp_video_no_audio_{index}_timeline.json"
-                     old_timeline_path = os.path.join(final_folder, old_timeline_name)
-                     
-                     new_timeline_name = f"{base_name_final}_timeline.json"
-                     new_timeline_path = os.path.join(final_folder, new_timeline_name)
-                     
-                     if os.path.exists(old_timeline_path):
-                         if os.path.exists(new_timeline_path): os.remove(new_timeline_path)
-                         os.rename(old_timeline_path, new_timeline_path)
-                         print(f"Renamed Timeline to Title: {new_timeline_name}")
-                         
-                     # 4. Rename Coords JSON
-                     old_coords_name = f"temp_video_no_audio_{index}_coords.json"
-                     old_coords_path = os.path.join(final_folder, old_coords_name)
-                     
-                     new_coords_name = f"{base_name_final}_coords.json"
-                     new_coords_path = os.path.join(final_folder, new_coords_name)
-                     
-                     if os.path.exists(old_coords_path):
-                         if os.path.exists(new_coords_path): os.remove(new_coords_path)
-                         os.rename(old_coords_path, new_coords_path)
-                         print(f"Renamed Coords to Title: {new_coords_name}")
-                         
-             except Exception as e:
-                 print(f"Warning: Could not rename file with title: {e}") 
-        
+            rename_outputs(index, base_name_final, project_folder, final_folder)
+
     # Save Face Modes to JSON for subtitle usage
     modes_file = os.path.join(project_folder, "face_modes.json")
     try:

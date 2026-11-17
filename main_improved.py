@@ -145,6 +145,7 @@ def main():
     parser.add_argument("--workflow", choices=["1", "2", "3"], default="1", help="Workflow choice: 1=Full, 2=Cut Only, 3=Subtitles Only")
     parser.add_argument("--face-model", choices=["insightface", "mediapipe"], default="insightface", help="Face detection model")
     parser.add_argument("--face-mode", choices=["auto", "1", "2"], default=None, help="Face tracking mode: auto, 1, 2 (default: from --video-type)")
+    parser.add_argument("--parallel-clips", default="auto", help="How many cuts to frame at the same time: auto (2 on GPU, 1 on CPU) or a number")
     parser.add_argument("--camera-style", choices=list(edit_video.CAMERA_STYLES), default=None, help="Virtual camera: calm (holds longer), normal, dynamic (follows faster). Default: from --video-type")
     parser.add_argument("--frame-layout", choices=list(edit_video.FRAME_LAYOUTS), default=None, help="crop = 9:16 crop following faces; fit-blur = full video centered over blurred background; fit-faces = full video centered with face zooms above/below (default: from --video-type)")
     parser.add_argument("--subtitle-config", help="Path to subtitle configuration JSON file")
@@ -641,7 +642,8 @@ def main():
                 segments_data=viral_segments.get("segments", []) if viral_segments else None,
                 no_face_mode=args.no_face_mode,
                 frame_layout=args.frame_layout,
-                camera_style=args.camera_style
+                camera_style=args.camera_style,
+                parallel_clips=args.parallel_clips
             )
 
 
@@ -756,6 +758,7 @@ def main():
                 "face_config": {
                     "frame_layout": args.frame_layout,
                     "camera_style": args.camera_style,
+                    "parallel_clips": args.parallel_clips,
                     "model": face_model,
                     "mode": face_mode,
                     "detect_interval": args.face_detect_interval,
