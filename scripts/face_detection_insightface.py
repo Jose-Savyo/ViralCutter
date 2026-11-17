@@ -15,6 +15,7 @@ except ImportError:
     INSIGHTFACE_AVAILABLE = False
 
 app = None
+_app_modules = None
 
 @contextmanager
 def suppress_stdout_stderr():
@@ -30,30 +31,37 @@ def suppress_stdout_stderr():
             sys.stdout = old_stdout
             sys.stderr = old_stderr
 
-def init_insightface():
-    """Explicit initialization if needed outside import."""
-    global app
+def init_insightface(with_landmarks=False):
+    """
+    Carrega so os modelos usados do buffalo_l: deteccao (sempre) e landmark 3D (so para
+    "focar em quem fala", que mede a abertura da boca). Reconhecimento facial, genero/idade
+    e landmark 2D nao sao usados e custavam mais que a propria deteccao (medido: 1.867 ms ->
+    285 ms por quadro com 6 rostos na CPU).
+    """
+    global app, _app_modules
     if not INSIGHTFACE_AVAILABLE:
         raise ImportError("InsightFace not installed. Please install it.")
-    
-    if app is None:
-        # Provider options to reduce logging if possible (often needs env var)
-        # But redirection is safer for C++ logs
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        
-        try:
-            import onnxruntime as ort
-            available = ort.get_available_providers()
-            print(f"InsightFace: Available ONNX Providers: {available}")
-            if 'CUDAExecutionProvider' not in available:
-                print("WARNING: CUDAExecutionProvider not found. InsightFace will likely run on CPU.")
-                print("To fix, install onnxruntime-gpu: pip install onnxruntime-gpu")
-        except Exception as e:
-            print(f"InsightFace: Could not check available providers: {e}")
 
-        with suppress_stdout_stderr():
-            app = FaceAnalysis(name='buffalo_l', providers=providers)
-            app.prepare(ctx_id=0, det_size=(640, 640))
+    modules = ['detection', 'landmark_3d_68'] if with_landmarks else ['detection']
+    if app is not None and _app_modules is not None and set(modules) <= set(_app_modules):
+        return app
+
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    try:
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+        print(f"InsightFace: Available ONNX Providers: {available}")
+        if 'CUDAExecutionProvider' not in available:
+            print("WARNING: CUDAExecutionProvider not found. InsightFace will likely run on CPU.")
+            print("To fix, install onnxruntime-gpu: pip install onnxruntime-gpu")
+    except Exception as e:
+        print(f"InsightFace: Could not check available providers: {e}")
+
+    with suppress_stdout_stderr():
+        app = FaceAnalysis(name='buffalo_l', providers=providers, allowed_modules=modules)
+        app.prepare(ctx_id=0, det_size=(640, 640))
+    _app_modules = modules
+    print(f"InsightFace: modelos carregados: {', '.join(modules)}")
     return app
 
 def detect_faces_insightface(frame):

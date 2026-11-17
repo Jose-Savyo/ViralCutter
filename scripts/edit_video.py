@@ -58,6 +58,45 @@ def get_best_encoder():
     CACHED_ENCODER = ("libx264", "ultrafast")
     return CACHED_ENCODER
 
+
+class FFmpegPipeWriter:
+    """
+    Grava quadros BGR direto em H.264 pelo pipe do ffmpeg, com o melhor encoder disponivel.
+    Substitui o cv2.VideoWriter('mp4v'): o mp4v era um encode extra na CPU, com perda, e
+    obrigava a juncao com o audio a re-encodar o video. Agora a juncao so copia o video.
+    """
+    def __init__(self, path, fps, width=1080, height=1920):
+        self.size = (width, height)
+        self._warned = False
+        encoder_name, encoder_preset = get_best_encoder()
+        cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-hide_banner',
+               '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{width}x{height}',
+               '-pix_fmt', 'bgr24', '-r', str(fps), '-i', '-',
+               '-c:v', encoder_name, '-preset', encoder_preset, '-pix_fmt', 'yuv420p']
+        if encoder_name == 'libx264':
+            cmd += ['-crf', '18']      # intermediario: a legenda re-encoda depois
+        else:
+            cmd += ['-b:v', '8M']
+        cmd.append(path)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def write(self, frame):
+        if frame.shape[1] != self.size[0] or frame.shape[0] != self.size[1]:
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+        try:
+            self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+        except (BrokenPipeError, OSError, ValueError) as e:
+            if not self._warned:
+                print(f"Error writing frame to ffmpeg pipe: {e}")
+                self._warned = True
+
+    def release(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        self.proc.wait()
+
 FRAME_LAYOUTS = ("crop", "fit-blur", "fit-faces")
 
 # Correlacao de histograma abaixo deste valor entre quadros consecutivos = troca de cena/camera.
@@ -246,14 +285,15 @@ def finalize_video(input_file, output_file, index, fps, project_folder, final_fo
 
     if os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
         final_output = os.path.join(final_folder, f"final-output{str(index).zfill(3)}_processed.mp4")
-        encoder_name, encoder_preset = get_best_encoder()
+        # O video ja sai em H.264 do enquadramento: so copia (sem re-encode)
         command = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", output_file,
             "-i", audio_file,
-            "-c:v", encoder_name, "-preset", encoder_preset, "-b:v", "5M",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-r", str(fps),
+            "-movflags", "+faststart",
             final_output
         ]
         try:
@@ -313,8 +353,7 @@ def generate_short_mediapipe(input_file, output_file, index, face_mode, project_
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_file, fourcc, fps, (1080, 1920))
+        out = FFmpegPipeWriter(output_file, fps)
 
         next_detection_frame = 0
         current_interval = int(5 * fps) # Initial guess
@@ -468,8 +507,7 @@ def generate_short_haar(input_file, output_file, index, project_folder, final_fo
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_file, fourcc, fps, (1080, 1920))
+    out = FFmpegPipeWriter(output_file, fps)
     
     # Logic copied from generate_short_mediapipe
     detection_interval = int(2 * fps) # Default check every 2 seconds
@@ -565,8 +603,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     ct = ClipTimer(f"Corte {index}", (total_frames / fps) if fps else 0)
     
     # Using mp4v for container, but final mux will fix encoding
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_file, fourcc, fps, (1080, 1920))
+    out = FFmpegPipeWriter(output_file, fps)
     
     # Dynamic Interval Logic
     next_detection_frame = 0
@@ -1286,7 +1323,7 @@ def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detec
     if INSIGHTFACE_AVAILABLE and (face_model == "insightface"):
         try:
             print("Initializing InsightFace...")
-            init_insightface()
+            init_insightface(with_landmarks=focus_active_speaker)
             insightface_working = True
             print("InsightFace Initialized Successfully.")
         except Exception as e:

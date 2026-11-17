@@ -174,6 +174,9 @@ def download(url, base_root="VIRALS", download_subs=True, quality="best", cookie
 
     ydl_opts = {
         'format': selected_format,
+        # Mesma resolucao, preferindo H.264: o OpenCV nao decodifica AV1 e a NVDEC da T4
+        # nao tem AV1; H.264 tambem decodifica mais rapido na CPU.
+        'format_sort': ['res', 'vcodec:h264'],
         'overwrites': True,
         'outtmpl': output_path_base, 
         'postprocessor_args': [
