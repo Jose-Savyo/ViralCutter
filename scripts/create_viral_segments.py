@@ -678,6 +678,87 @@ def snap_end(start, desired_end, transcript_segments, min_duration, max_duration
     # Curto demais ou fim nao encontrado: primeiro fim de frase depois do minimo
     return min(s['end'] for s in pool), "depois-do-min"
 
+# --- Respiro no inicio e no fim do corte (com o tempo de cada palavra) ---
+PAD_START_SECONDS = 0.25   # entra um pouco antes da 1a palavra (sem pegar a anterior)
+PAD_END_SECONDS = 0.45     # sai um pouco depois da ultima palavra (sem pegar a proxima)
+SENTENCE_SEARCH_SECONDS = 4.0
+
+
+def load_words(project_folder):
+    """Palavras com tempo do input.json do WhisperX (ou da legenda do YouTube). [(inicio, fim, texto)]"""
+    path = os.path.join(project_folder, "input.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[WARN] input.json ilegível para o respiro dos cortes: {e}")
+        return []
+    words = []
+    for seg in data.get("segments", []):
+        for w in seg.get("words", []) or []:
+            if w.get("start") is not None and w.get("end") is not None:
+                words.append((float(w["start"]), float(w["end"]), str(w.get("word", "")).strip()))
+    words.sort()
+    return words
+
+
+def refine_boundaries(start, end, words, min_duration, max_duration):
+    """
+    Ajusta o corte para comecar e terminar com respiro, como um editor:
+    - nunca no meio de uma palavra;
+    - fim no fim de uma frase quando houver uma por perto (+-4 s) sem sair dos limites;
+    - entrada ate 0,25 s antes da 1a palavra e saida ate 0,45 s depois da ultima,
+      sem invadir a palavra anterior/seguinte.
+    Retorna (inicio, fim).
+    """
+    if not words:
+        return start, end
+    eps = 0.02
+    # Inicio: nunca no meio da palavra
+    for w0, w1, _ in words:
+        if w0 < start - eps < w1 or w0 < start < w1:
+            start = w0
+            break
+    # Fim: nunca no meio da palavra
+    for w0, w1, _ in words:
+        if w0 < end < w1:
+            end = w1
+            break
+    inside = [i for i, w in enumerate(words) if w[0] >= start - eps and w[1] <= end + eps]
+    if not inside:
+        return start, end
+    i_first, i_last = inside[0], inside[-1]
+
+    # Prefere terminar no fim de uma frase proxima, dentro de [min, max + respiro]
+    if not SENTENCE_END_RE.search(words[i_last][2]):
+        best = None
+        for j, (w0, w1, txt) in enumerate(words):
+            if abs(w1 - end) > SENTENCE_SEARCH_SECONDS or not SENTENCE_END_RE.search(txt):
+                continue
+            dur = w1 - words[i_first][0]
+            if min_duration <= dur <= max_duration + PAD_END_SECONDS and j >= i_first:
+                if best is None or abs(w1 - end) < abs(words[best][1] - end):
+                    best = j
+        if best is not None:
+            i_last = best
+
+    first_start = words[i_first][0]
+    prev_end = words[i_first - 1][1] if i_first > 0 else None
+    new_start = first_start - PAD_START_SECONDS
+    if prev_end is not None:
+        new_start = max(new_start, min(prev_end + 0.05, first_start))
+    new_start = max(0.0, new_start)
+
+    last_end = words[i_last][1]
+    next_start = words[i_last + 1][0] if i_last + 1 < len(words) else None
+    new_end = last_end + PAD_END_SECONDS
+    if next_start is not None:
+        new_end = min(new_end, max(next_start - 0.05, last_end))
+    return new_start, new_end
+
+
 HOOK_MAX_WORDS = 10
 
 
@@ -740,7 +821,7 @@ def heuristic_segments(transcript_segments, count, min_duration, max_duration, h
     return {"segments": out}
 
 
-def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None, heatmap=None):
+def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None, heatmap=None, words=None):
     """
     Aligns raw AI segments (with reference tags) to actual transcript timestamps.
     Applies constraints, validation, and deduplication.
@@ -841,6 +922,12 @@ def process_segments(raw_segments, transcript_segments, min_duration, max_durati
             if snap_reason != "ok":
                 desired_txt = f"{desired_end - final_start_time:.1f}s" if desired_end is not None else "end_text não encontrado"
                 print(f"[INFO] Fim ajustado ({snap_reason}): {desired_txt} -> {duration:.1f}s")
+
+            # Respiro: entra antes da 1a palavra e sai depois da ultima (sem cortar palavra)
+            if words:
+                final_start_time, final_end_time = refine_boundaries(final_start_time, final_end_time, words,
+                                                                     tempo_minimo, tempo_maximo)
+                duration = final_end_time - final_start_time
 
             # Construct Final Segment
             processed_segments.append({
@@ -1449,7 +1536,8 @@ OUTPUT JSON ONLY:
         tempo_minimo, 
         tempo_maximo, 
         output_count=quantidade_de_virals,
-        heatmap=heatmap
+        heatmap=heatmap,
+        words=load_words(project_folder)
     )
     if not result.get("segments") and ai_mode != "manual":
         print("[WARN] A IA não devolveu nenhum corte aproveitável. Usando a heurística de reserva "

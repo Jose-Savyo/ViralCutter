@@ -278,6 +278,32 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
         finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
     CLIP_TIMINGS.append(ct.finish())
 
+AUDIO_FADE_IN = 0.08    # s: sem "clique" no primeiro quadro
+AUDIO_FADE_OUT = 0.25   # s: a fala termina e o som sai suave
+# -14 LUFS (padrao das redes); TP -2: com -1,5 o AAC ainda estourava (medicao do openshorts)
+LOUDNORM_FILTER = "loudnorm=I=-14:TP=-2.0:LRA=11"
+
+
+def _media_duration(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                             capture_output=True, text=True).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def audio_finish_filter(duration):
+    """Fade de entrada/saida + volume padronizado (VIRALCUTTER_LOUDNORM=0 desliga o loudnorm)."""
+    parts = [f"afade=t=in:st=0:d={AUDIO_FADE_IN}"]
+    if duration > 2 * AUDIO_FADE_OUT:
+        parts.append(f"afade=t=out:st={duration - AUDIO_FADE_OUT:.3f}:d={AUDIO_FADE_OUT}")
+    if os.environ.get("VIRALCUTTER_LOUDNORM", "1") != "0":
+        parts.append(LOUDNORM_FILTER)
+    parts.append("aresample=48000")  # o loudnorm sai a 192 kHz
+    return ",".join(parts)
+
+
 def finalize_video(input_file, output_file, index, fps, project_folder, final_folder):
     """Mux audio and video."""
     audio_file = os.path.join(project_folder, "cuts", f"output-audio-{index}.aac")
@@ -286,14 +312,17 @@ def finalize_video(input_file, output_file, index, fps, project_folder, final_fo
 
     if os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
         final_output = os.path.join(final_folder, f"final-output{str(index).zfill(3)}_processed.mp4")
-        # O video ja sai em H.264 do enquadramento: so copia (sem re-encode)
+        # O video ja sai em H.264 do enquadramento: so copia (sem re-encode).
+        # O audio ja e re-encodado aqui: fade e volume padronizado entram de graca.
         command = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", output_file,
             "-i", audio_file,
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy",
+            "-af", audio_finish_filter(_media_duration(output_file)),
             "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
             "-movflags", "+faststart",
             final_output
         ]
