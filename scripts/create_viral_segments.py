@@ -685,7 +685,7 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
         "gemini": {
             "api_key": "",
             "model": "gemini-flash-lite-latest",
-            "chunk_size": 15000
+            "chunk_size": 200000
         },
         "g4f": {
             "chunk_size": 2000
@@ -694,12 +694,12 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
             "api_key": "",
             "model": DEFAULT_OPENAI_MODEL,
             "base_url": DEFAULT_OPENAI_BASE_URL,
-            "chunk_size": 15000
+            "chunk_size": 100000
         },
         "anthropic": {
             "api_key": "",
             "model": DEFAULT_ANTHROPIC_MODEL,
-            "chunk_size": 15000
+            "chunk_size": 100000
         }
     }
 
@@ -719,7 +719,7 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
     model_name = ""
     
     if ai_mode == "gemini":
-        cfg_chunk = config["gemini"].get("chunk_size", 15000)
+        cfg_chunk = config["gemini"].get("chunk_size", 200000)
         current_chunk_size = chunk_size_arg if chunk_size_arg and int(chunk_size_arg) > 0 else cfg_chunk
         cfg_model = config["gemini"].get("model", "gemini-flash-lite-latest")
         model_name = model_name_arg if model_name_arg else cfg_model
@@ -733,7 +733,7 @@ def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode
 
     elif ai_mode in ("openai", "anthropic"):
         section = config[ai_mode]
-        cfg_chunk = section.get("chunk_size", 15000)
+        cfg_chunk = section.get("chunk_size", 100000)
         current_chunk_size = chunk_size_arg if chunk_size_arg and int(chunk_size_arg) > 0 else cfg_chunk
         model_name = model_name_arg if model_name_arg else section.get("model")
         env_var = "OPENAI_API_KEY" if ai_mode == "openai" else "ANTHROPIC_API_KEY"
@@ -892,7 +892,7 @@ OUTPUT JSON ONLY:
             print(f"Failed to load model: {e}")
             return {"segments": []}
 
-    for i, prompt in enumerate(output_texts):
+    def _ask(i, prompt):
         response_text = ""
         manual_prompt_path = os.path.join(project_folder, f"prompt_part_{i+1}.txt")
         try:
@@ -962,6 +962,29 @@ OUTPUT JSON ONLY:
                 print(f"Error evaluating local model: {e}")
                 response_text = "{}"
 
+        return response_text
+
+    cloud_modes = ("gemini", "openai", "anthropic", "g4f")
+    responses = [None] * len(output_texts)
+    if ai_mode in cloud_modes and len(output_texts) > 1:
+        workers = max(1, min(int(os.environ.get("VIRALCUTTER_AI_WORKERS", "3")), len(output_texts)))
+        print(f"Enviando {len(output_texts)} chunks em paralelo ({workers} por vez)...")
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_ask, i, pr): i for i, pr in enumerate(output_texts)}
+            for fut in futures:
+                i = futures[fut]
+                try:
+                    responses[i] = fut.result()
+                except Exception as e:
+                    print(f"Erro no chunk {i+1}: {e}")
+                    responses[i] = ""
+    else:
+        for i, pr in enumerate(output_texts):
+            responses[i] = _ask(i, pr)
+
+    for i, response_text in enumerate(responses):
+        response_text = response_text or ""
         # --- Save RAW Response for Debugging ---
         try:
             raw_response_path = os.path.join(project_folder, f"response_raw_part_{i+1}.txt")
