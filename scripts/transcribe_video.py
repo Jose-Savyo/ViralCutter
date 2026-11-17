@@ -173,6 +173,97 @@ def parse_vtt(vtt_path):
         return None
     return segments
 
+_VTT_TS = r'(\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})'
+
+
+def clean_caption_text(text):
+    """Limpa texto de legenda do YouTube: tags, entidades HTML (&gt;&gt;), marcadores >> e [Música]."""
+    import html
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    text = text.replace('>>', ' ')
+    text = re.sub(r'\[[^\]]*\]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _ts_to_seconds(t_str):
+    parts = t_str.strip().replace(',', '.').split(':')
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return 0.0
+
+
+def parse_youtube_vtt_words(vtt_path):
+    """
+    Le a legenda automatica do YouTube (formato karaoke) com o tempo de cada palavra:
+    "texto<00:00:01.120><c> palavra</c><00:00:01.400><c> outra</c>".
+    So as linhas com marcacao de tempo trazem palavras novas (as outras repetem a linha anterior).
+    Retorna (segments, idioma) ou (None, idioma) se a legenda nao tiver tempo por palavra.
+    """
+    language = None
+    segments = []
+    cue_start = cue_end = None
+    try:
+        with open(vtt_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"Error reading VTT {vtt_path}: {e}")
+        return None, None
+
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith('Language:'):
+            language = line.split(':', 1)[1].strip() or None
+            continue
+        if '-->' in line:
+            a, b = line.split('-->')
+            cue_start = _ts_to_seconds(a)
+            cue_end = _ts_to_seconds(b.strip().split(' ')[0])
+            continue
+        if cue_start is None or not re.search('<' + _VTT_TS + '>', line):
+            continue
+        parts = re.split('<' + _VTT_TS + '>', line)
+        times = [cue_start] + [_ts_to_seconds(t) for t in parts[1::2]]
+        words = []
+        for t, chunk in zip(times, parts[0::2]):
+            for w in clean_caption_text(chunk).split():
+                words.append({"word": w, "start": round(t, 3)})
+        if not words:
+            continue
+        for i, w in enumerate(words):
+            nxt = words[i + 1]["start"] if i + 1 < len(words) else min(cue_end, w["start"] + 1.0)
+            w["end"] = round(max(nxt, w["start"] + 0.05), 3)
+            w["score"] = 1.0
+        segments.append({
+            "start": words[0]["start"],
+            "end": words[-1]["end"],
+            "text": " ".join(w["word"] for w in words),
+            "words": words,
+        })
+    return (segments or None), language
+
+
+def add_estimated_words(segments):
+    """Legenda sem tempo por palavra: distribui o tempo do trecho entre as palavras pelo tamanho."""
+    out = []
+    for seg in segments:
+        text = clean_caption_text(seg.get("text", ""))
+        tokens = text.split()
+        if not tokens:
+            continue
+        start, end = float(seg["start"]), float(seg["end"])
+        total = sum(len(t) + 1 for t in tokens)
+        words, t = [], start
+        for tok in tokens:
+            dur = (end - start) * (len(tok) + 1) / total
+            words.append({"word": tok, "start": round(t, 3), "end": round(t + dur, 3), "score": 1.0})
+            t += dur
+        out.append({"start": start, "end": end, "text": text, "words": words})
+    return out
+
+
 def pick_batch_size(device):
     """Escolhe o batch do Whisper pela VRAM total. Env VIRALCUTTER_WHISPER_BATCH força um valor."""
     forced = os.environ.get("VIRALCUTTER_WHISPER_BATCH")
@@ -241,47 +332,39 @@ def transcribe(input_file, model_name='large-v3', project_folder='tmp', batch_si
         print(f"Carregando áudio: {input_file}")
         audio = whisperx.load_audio(input_file)
         
-        # 2. Verificar se existem legendas baixadas para Alignment Only
-        # Procurar por *.srt E *.vtt na pasta que comecem com input (ou o nome base)
-        if os.path.exists(os.path.join(output_folder, "input.srt")):
-            potential_subs = [os.path.join(output_folder, "input.srt")]
-        elif os.path.exists(os.path.join(output_folder, "input.vtt")):
-            potential_subs = [os.path.join(output_folder, "input.vtt")]
-        else:
-            potential_subs = []
-        
+        # 2. Legenda do YouTube: usa os tempos da propria legenda e pula transcricao e alinhamento.
+        # input.vtt (automatica, com tempo por palavra) tem prioridade sobre input.srt.
+        vtt_path = os.path.join(output_folder, "input.vtt")
+        srt_path = os.path.join(output_folder, "input.srt")
+
         start_segments = None
-        alignment_only = False
-        
-        # Default blind guess if we have no info
-        detected_language = "en" 
+        alignment_only = False  # True = legenda pronta, sem transcrever nem alinhar
+        detected_language = "und"
 
-        if potential_subs:
-            sub_path = potential_subs[0]
-            print(f"Usando legenda fornecida: {sub_path}")
-            
-            if sub_path.endswith('.srt'):
-                parsed = parse_srt(sub_path)
-            elif sub_path.endswith('.vtt'):
-                parsed = parse_vtt(sub_path)
+        if os.path.exists(vtt_path):
+            print(f"Usando legenda do YouTube: {vtt_path}")
+            parsed, sub_lang = parse_youtube_vtt_words(vtt_path)
+            if parsed:
+                print(f"Legenda com tempo por palavra: {len(parsed)} trechos.")
             else:
-                parsed = None
+                parsed = parse_vtt(vtt_path)
+                parsed = add_estimated_words(parsed) if parsed else None
+            if parsed:
+                start_segments, alignment_only = parsed, True
+                detected_language = sub_lang or detected_language
+        if not alignment_only and os.path.exists(srt_path):
+            print(f"Usando legenda do YouTube: {srt_path}")
+            parsed = parse_srt(srt_path)
+            if parsed:
+                start_segments, alignment_only = add_estimated_words(parsed), True
 
-            if parsed and len(parsed) > 0:
-                start_segments = parsed
-                alignment_only = True
-                
-                # Forçar EN conforme solicitado pelo usuário para alinhamento
-                detected_language = 'en'
-                print(f"Idioma forçado para alinhamento: {detected_language}")
-                
-                print("--- MODO ALINHAMENTO RÁPIDO ATIVADO ---")
-        
+        if alignment_only:
+            print("--- LEGENDA DO YOUTUBE: sem transcrição e sem alinhamento ---")
+
         result = None
         
         if alignment_only and start_segments:
-            # Pular Transcrição, ir direto para Alinhamento
-            print("--- MODO ALINHAMENTO RÁPIDO ATIVADO ---")
+            # Legenda pronta: pula a transcrição
             # Estrutura que o align espera: {'segments': [...], 'language': ...}
             # Mas o align recebe segments como lista.
             pass 
@@ -324,34 +407,37 @@ def transcribe(input_file, model_name='large-v3', project_folder='tmp', batch_si
                 torch.cuda.empty_cache()
 
         # 4. Alinhar (Sempre executado, seja com subs parsed ou transcritos)
-        print(f"Alinhando transcrição (Idioma: {detected_language}) para obter timestamps precisos...")
-        # Usa o modelo específico solicitado pelo usuário: WAV2VEC2_ASR_LARGE_LV60K_960H
-        # Mas o whisperx.load_align_model escolhe automaticamente baseado na linguagem.
-        # Se for inglês, ele usa wav2vec2-large-960h-lv60-self geralmente.
-        # Não podemos forçar facilmente o modelo exato sem hackear o whisperx, mas o padrão é bom.
+        if alignment_only:
+            result = {"segments": start_segments, "language": detected_language}
+        else:
+            print(f"Alinhando transcrição (Idioma: {detected_language}) para obter timestamps precisos...")
+            # Usa o modelo específico solicitado pelo usuário: WAV2VEC2_ASR_LARGE_LV60K_960H
+            # Mas o whisperx.load_align_model escolhe automaticamente baseado na linguagem.
+            # Se for inglês, ele usa wav2vec2-large-960h-lv60-self geralmente.
+            # Não podemos forçar facilmente o modelo exato sem hackear o whisperx, mas o padrão é bom.
         
-        try:
-            model_a, metadata = whisperx.load_align_model(language_code=detected_language, device=device)
+            try:
+                model_a, metadata = whisperx.load_align_model(language_code=detected_language, device=device)
             
-            aligned_result = whisperx.align(start_segments, model_a, metadata, audio, device, return_char_alignments=False)
+                aligned_result = whisperx.align(start_segments, model_a, metadata, audio, device, return_char_alignments=False)
             
-            # aligned_result agora contém "segments" com word timestamps
-            result = aligned_result
-            result["language"] = detected_language
+                # aligned_result agora contém "segments" com word timestamps
+                result = aligned_result
+                result["language"] = detected_language
             
-            if device == "cuda":
-                 del model_a
-                 torch.cuda.empty_cache()
+                if device == "cuda":
+                     del model_a
+                     torch.cuda.empty_cache()
                  
-        except Exception as e:
-            print(f"Erro durante alinhamento: {e}. ")
-            if alignment_only:
-                 print("Falha crítica no alinhamento de legendas externas. Abortando usage de legendas externas.")
-                 # Opcional: Fallback para transcrição normal se falhar? Seria complexo aqui pois já limpamos memória.
-                 # Vamos apenas salvar o que temos (timestamps da legenda original podem não bater com áudio perfeitamente se não alinhar)
-                 result = {"segments": start_segments, "language": detected_language}
-            else:
-                 print("Continuando com transcrição bruta.")
+            except Exception as e:
+                print(f"Erro durante alinhamento: {e}. ")
+                if alignment_only:
+                     print("Falha crítica no alinhamento de legendas externas. Abortando usage de legendas externas.")
+                     # Opcional: Fallback para transcrição normal se falhar? Seria complexo aqui pois já limpamos memória.
+                     # Vamos apenas salvar o que temos (timestamps da legenda original podem não bater com áudio perfeitamente se não alinhar)
+                     result = {"segments": start_segments, "language": detected_language}
+                else:
+                     print("Continuando com transcrição bruta.")
 
         # 5. Salvar Resultados
         print("Salvando resultados...")

@@ -282,7 +282,8 @@ def download(url, base_root="VIRALS", download_subs=True, quality="best", cookie
                              # Texto: remover tags complexas <00:00:00.560><c> etc
                              # O YouTube usa formato karaoke. Ex: "Quanto<...> custa<...>"
                              # Precisamos do texto limpo.
-                             text = re.sub(r'<[^>]+>', '', clean_line).strip()
+                             import html
+                             text = html.unescape(re.sub(r'<[^>]+>', '', clean_line)).replace('>>', ' ').strip()
                              
                              if not text: continue
                              
@@ -319,8 +320,14 @@ def download(url, base_root="VIRALS", download_subs=True, quality="best", cookie
                         print(i18n("Subtitle converted and cleaned: {}").format(new_name))
                     except UnicodeEncodeError:
                         print(i18n("Subtitle converted and cleaned: {}").format(new_name.encode('ascii', 'replace').decode('ascii')))
-                    try: os.remove(best_sub) 
-                    except: pass
+                    # Mantem o VTT original como input.vtt: ele tem o tempo de cada palavra
+                    keep_vtt = os.path.join(project_folder, "input.vtt")
+                    try:
+                        if os.path.exists(keep_vtt) and keep_vtt != best_sub:
+                            os.remove(keep_vtt)
+                        os.rename(best_sub, keep_vtt)
+                    except Exception:
+                        pass
                     
                 except Exception as e_conv:
                     print(i18n("Failed to convert VTT: {}. Keeping original.").format(e_conv))
