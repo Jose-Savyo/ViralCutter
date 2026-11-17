@@ -77,6 +77,8 @@ def is_scene_cut(prev_hist, cur_hist, threshold=SCENE_CUT_THRESHOLD):
     return cv2.compareHist(prev_hist, cur_hist, cv2.HISTCMP_CORREL) < threshold
 
 # --- fit-faces: rostos persistentes e layout adaptativo ---
+STABLE_ZONE_RATIO = 0.11      # camera parada enquanto o rosto anda menos que 11% da altura do quadro (~120 px em 1080p)
+REFRAME_SECONDS = 0.5         # duracao do movimento quando precisa reenquadrar
 FIT_BIG_FACE_RATIO = 0.18      # rosto com altura > 18% do quadro = camera de estudio -> usa crop
 FIT_SWITCH_SECONDS = 0.75      # tempo minimo antes de trocar crop <-> fit-faces (fora troca de cena)
 FIT_CONTENT_FACE_FACTOR = 1.6  # com 3+ rostos, maior > 1.6x o segundo = conteudo da tela, nao webcam
@@ -569,7 +571,10 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     prev_hist = None
     scene_cut_count = 0
 
-    transition_duration = 4 # Smooth transition over 4 frames (almost continuous)
+    # Enquadramento estavel: a camera so se move quando o rosto sai de uma zona central
+    # (proporcional ao quadro) e, quando move, desliza em ~0,5 s com suavizacao.
+    transition_duration = max(4, int(REFRAME_SECONDS * fps))
+    stable_zone = max(float(dead_zone), STABLE_ZONE_RATIO * frame_height)
     transition_frames = []
 
     # Current state of face mode (1 or 2)
@@ -1000,11 +1005,8 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                     for i in range(len(detections)):
                         old_c = get_center_bbox(last_detected_faces[i])
                         new_c = get_center_bbox(detections[i])
-                        dist = np.sqrt((old_c[0]-new_c[0])**2 + (old_c[1]-new_c[1])**2)
-                        
-                        # Threshold: dead_zone variable (pixels)
-                        # Reduced jitter for talking heads
-                        if dist > dead_zone: 
+                        # Zona estavel: ignora movimentos pequenos (cabeca balancando, ruido da deteccao)
+                        if abs(old_c[0]-new_c[0]) > stable_zone or abs(old_c[1]-new_c[1]) > stable_zone: 
                             is_stable = False
                             break
                     
@@ -1037,6 +1039,7 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
                         transition_frames = []
                         for s in range(steps):
                             t = (s + 1) / steps
+                            t = t * t * (3 - 2 * t)  # ease-in-out: sem tranco no inicio/fim
                             interp = (1 - t) * start_faces + t * end_faces
                             transition_frames.append(interp.astype(int).tolist())
                         

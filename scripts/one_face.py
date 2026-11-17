@@ -177,7 +177,7 @@ def fit_to_width(frame, width=TARGET_W):
     return cv2.resize(frame, (width, h), interpolation=cv2.INTER_AREA)
 
 
-def crop_band(frame, bbox, band_w, band_h, face_scale=2.4, crop_aspect=1.0):
+def crop_band(frame, bbox, band_w, band_h, face_scale=3.0, crop_aspect=1.0):
     """
     Zoom no rosto para uma faixa band_w x band_h.
     Recorta uma regiao quase quadrada (crop_aspect = w/h) em volta do rosto, para nao pegar
