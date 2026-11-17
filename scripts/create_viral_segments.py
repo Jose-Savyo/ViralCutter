@@ -466,7 +466,7 @@ def snap_end(start, desired_end, transcript_segments, min_duration, max_duration
     # Curto demais ou fim nao encontrado: primeiro fim de frase depois do minimo
     return min(s['end'] for s in pool), "depois-do-min"
 
-def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None):
+def process_segments(raw_segments, transcript_segments, min_duration, max_duration, output_count=None, heatmap=None):
     """
     Aligns raw AI segments (with reference tags) to actual transcript timestamps.
     Applies constraints, validation, and deduplication.
@@ -583,6 +583,18 @@ def process_segments(raw_segments, transcript_segments, min_duration, max_durati
             print(f"[WARN] Error processing segment {seg}: {e}")
             continue
 
+    # Bonus "mais repetidos": cortes em trechos que o publico reassistiu sobem na lista
+    if heatmap:
+        for seg in processed_segments:
+            heat = heat_average(heatmap, seg["start_time"], seg["end_time"])
+            if heat is not None:
+                bonus = int(round(HEAT_SCORE_BONUS * heat))
+                seg["replay"] = round(heat, 3)
+                try:
+                    seg["score"] = int(seg.get("score", 0)) + bonus
+                except (TypeError, ValueError):
+                    seg["score"] = bonus
+
     # Deduplication
     unique_segments = []
     processed_segments.sort(key=lambda x: int(x.get('score', 0)), reverse=True)
@@ -660,6 +672,134 @@ VIDEO_TYPE_INSTRUCTIONS = {
         "Avoid segments that depend on slides or steps shown earlier."
     ),
 }
+
+# --- Capitulos e "mais repetidos" do YouTube ---
+HEAT_PEAK_QUANTILE = 0.85   # trechos no top 15% da curva de repeticao = picos
+HEAT_SCORE_BONUS = 15       # pontos extras (0-15) para cortes em trechos muito repetidos
+
+
+def load_youtube_meta(project_folder):
+    path = os.path.join(project_folder, "youtube_meta.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception as e:
+        print(f"[WARN] youtube_meta.json invalido: {e}")
+        return {}
+
+
+def heat_peaks(heatmap, quantile=HEAT_PEAK_QUANTILE):
+    """Junta os pontos do heatmap acima do quantil em intervalos [(inicio, fim), ...]."""
+    pts = [h for h in (heatmap or []) if h.get("value") is not None]
+    if len(pts) < 10:
+        return []
+    vals = sorted(h["value"] for h in pts)
+    thr = vals[min(len(vals) - 1, int(len(vals) * quantile))]
+    peaks = []
+    for h in sorted(pts, key=lambda x: x["start_time"]):
+        if h["value"] >= thr:
+            if peaks and h["start_time"] <= peaks[-1][1] + 0.5:
+                peaks[-1][1] = h["end_time"]
+            else:
+                peaks.append([h["start_time"], h["end_time"]])
+    return [(a, b) for a, b in peaks]
+
+
+def heat_average(heatmap, start, end):
+    """Media da curva de repeticao (0-1) no intervalo, ponderada pela sobreposicao."""
+    total = weight = 0.0
+    for h in heatmap or []:
+        ov = min(end, h["end_time"]) - max(start, h["start_time"])
+        if ov > 0 and h.get("value") is not None:
+            total += h["value"] * ov
+            weight += ov
+    return total / weight if weight else None
+
+
+def split_text(content, chunk_size):
+    """Divide texto em pedacos de ate chunk_size caracteres (quebra em espaco, com sobreposicao)."""
+    overlap_size = max(1000, int(chunk_size * 0.1))
+    chunks, start, n = [], 0, len(content)
+    while start < n:
+        end = min(start + chunk_size, n)
+        if end < n:
+            last_space = content.rfind(' ', start, end)
+            if last_space != -1 and last_space > start:
+                end = last_space
+        if content[start:end].strip():
+            chunks.append(content[start:end])
+        if end >= n:
+            break
+        next_start = max(start + 1, end - overlap_size)
+        safe_space = content.rfind(' ', start, next_start)
+        start = safe_space + 1 if safe_space != -1 else next_start
+    return chunks
+
+
+def chapter_texts(transcript_segments, chapters):
+    """Texto da transcricao de cada capitulo, com o titulo no inicio."""
+    out = []
+    for ch in chapters:
+        a, b = float(ch.get("start_time") or 0), float(ch.get("end_time") or 0)
+        segs = [x for x in transcript_segments if a <= x["start"] < b]
+        if segs:
+            out.append(f"[Chapter: {ch.get('title', '')}] " + preprocess_transcript_for_ai(segs))
+    return out
+
+
+def pack_chunks(texts, chunk_size):
+    """Agrupa textos (capitulos) em chunks de ate chunk_size, sem cortar capitulo no meio."""
+    chunks, cur = [], ""
+    for t in texts:
+        if len(t) > chunk_size:
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.extend(split_text(t, chunk_size))
+        elif len(cur) + len(t) + 1 > chunk_size:
+            chunks.append(cur); cur = t
+        else:
+            cur = (cur + " " + t).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def chunk_time_range(chunk):
+    tags = [int(t) for t in re.findall(r'\((\d+)s\)', chunk)]
+    return (min(tags), max(tags)) if tags else (None, None)
+
+
+def call_provider(ai_mode, prompt, api_key, model_name, base_url=None):
+    if ai_mode == "gemini":
+        return call_gemini(prompt, api_key, model_name=model_name)
+    if ai_mode == "openai":
+        return call_openai_compatible(prompt, api_key, model_name=model_name, base_url=base_url)
+    if ai_mode == "anthropic":
+        return call_anthropic(prompt, api_key, model_name=model_name)
+    if ai_mode == "g4f":
+        return call_g4f(prompt, model_name=model_name)
+    return ""
+
+
+def select_chapters_by_theme(chapters, themes, ai_mode, api_key, model_name, base_url=None):
+    """Chamada rapida so com os titulos: quais capitulos falam dos temas. Retorna indices ou None."""
+    listing = "\n".join(f"{i}: {c.get('title', '')}" for i, c in enumerate(chapters))
+    prompt = ("These are the chapter titles of a long video:\n" + listing +
+              f"\n\nWhich chapters are likely to discuss any of these themes: {themes}?\n"
+              "Be inclusive: when unsure, include the chapter. "
+              'Answer with JSON only, like {"chapters": [0, 3, 4]}.')
+    try:
+        text = call_provider(ai_mode, prompt, api_key, model_name, base_url) or ""
+        m = re.search(r'"chapters"\s*:\s*\[([^\]]*)\]', text)
+        nums = re.findall(r'\d+', m.group(1)) if m else []
+        idx = sorted({int(i) for i in nums if 0 <= int(i) < len(chapters)})
+        return idx or None
+    except Exception as e:
+        print(f"[WARN] Filtro de capitulos falhou ({e}); usando todos.")
+        return None
+
 
 def create(num_segments, viral_mode, themes, tempo_minimo, tempo_maximo, ai_mode="manual", api_key=None, project_folder="tmp", chunk_size_arg=None, model_name_arg=None, video_type="generic", base_url=None):
     quantidade_de_virals = num_segments
@@ -780,33 +920,30 @@ OUTPUT JSON ONLY:
             }
         '''
 
-    # Chunking
+    # Chunking: pelos capitulos do YouTube quando existirem; senao, por tamanho fixo
     chunk_size = int(current_chunk_size)
-    overlap_size = max(1000, int(chunk_size * 0.1))
-    
+    yt_meta = load_youtube_meta(project_folder)
+    chapters = [c for c in (yt_meta.get("chapters") or []) if c.get("end_time")]
+    heatmap = yt_meta.get("heatmap") or []
+    peaks = heat_peaks(heatmap)
+
     chunks = []
-    start = 0
-    content_len = len(content)
-
-    print(f"[DEBUG] Chunking content (Size: {content_len}) with Chunk Size: {chunk_size} and Overlap: {overlap_size}")
-
-    while start < content_len:
-        end = min(start + chunk_size, content_len)
-        if end < content_len:
-            last_space = content.rfind(' ', start, end)
-            if last_space != -1 and last_space > start:
-                end = last_space
-        chunk_text = content[start:end]
-        if chunk_text.strip():
-            chunks.append(chunk_text)
-        if end >= content_len:
-            break
-        next_start = max(start + 1, end - overlap_size)
-        safe_space = content.rfind(' ', start, next_start)
-        if safe_space != -1:
-            start = safe_space + 1
-        else:
-            start = next_start
+    if len(chapters) >= 2:
+        has_themes = bool((themes or "").strip()) and not viral_mode
+        if has_themes and ai_mode in ("gemini", "openai", "anthropic", "g4f"):
+            keep = select_chapters_by_theme(chapters, themes, ai_mode, api_key, model_name, base_url)
+            if keep:
+                print(f"Capitulos sobre os temas: {len(keep)} de {len(chapters)} -> " +
+                      "; ".join(chapters[i].get('title', '') for i in keep))
+                chapters = [chapters[i] for i in keep]
+        texts = chapter_texts(transcript_segments, chapters)
+        chunks = pack_chunks(texts, chunk_size)
+        print(f"[DEBUG] Chunking por {len(chapters)} capitulo(s) -> {len(chunks)} chunk(s) (limite {chunk_size})")
+    if not chunks:
+        print(f"[DEBUG] Chunking content (Size: {len(content)}) with Chunk Size: {chunk_size}")
+        chunks = split_text(content, chunk_size)
+    if peaks:
+        print(f"YouTube 'mais repetidos': {len(peaks)} pico(s) marcados para a IA.")
 
     if viral_mode or not (themes or "").strip():
         virality_instruction = f"identify the {quantidade_de_virals} segments with the highest viral potential"
@@ -819,6 +956,13 @@ OUTPUT JSON ONLY:
         context_instruction = ""
         if len(chunks) > 1:
             context_instruction = f"Part {i+1} of {len(chunks)}. "
+        if peaks:
+            lo, hi = chunk_time_range(chunk)
+            inside = [(a_, b_) for a_, b_ in peaks if lo is not None and b_ >= lo and a_ <= hi]
+            if inside:
+                spans = ", ".join(f"{int(a_)}s-{int(b_)}s" for a_, b_ in inside)
+                context_instruction += (f"YouTube viewers rewatched these moments the most (strong signal of "
+                                        f"interest): {spans}. Prefer segments that include them. ")
         
         try:
             prompt = system_prompt_template.format(
@@ -1011,5 +1155,6 @@ OUTPUT JSON ONLY:
         transcript_segments, 
         tempo_minimo, 
         tempo_maximo, 
-        output_count=quantidade_de_virals
+        output_count=quantidade_de_virals,
+        heatmap=heatmap
     )

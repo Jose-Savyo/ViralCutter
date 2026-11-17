@@ -66,6 +66,7 @@ def download(url, base_root="VIRALS", download_subs=True, quality="best", cookie
     # 1. Extrair informações do vídeo para pegar o título
     print(i18n("Extracting video information..."))
     title = None
+    info = None
     
     # ... (Keep existing title extraction logic) ...
     # Instead of repeating it effectively, I will rely on the diff to keep it or re-write it if I have to replace the whole block.
@@ -114,6 +115,23 @@ def download(url, base_root="VIRALS", download_subs=True, quality="best", cookie
     # 2. Criar estrutura de pastas
     project_folder = os.path.join(base_root, safe_title)
     os.makedirs(project_folder, exist_ok=True)
+
+    # Capitulos e curva de "mais repetidos" do YouTube (usados na selecao dos cortes)
+    if info:
+        try:
+            import json as _json
+            meta = {
+                "duration": info.get("duration"),
+                "chapters": [{"start_time": c.get("start_time"), "end_time": c.get("end_time"), "title": c.get("title")}
+                             for c in (info.get("chapters") or [])],
+                "heatmap": [{"start_time": h.get("start_time"), "end_time": h.get("end_time"), "value": h.get("value")}
+                            for h in (info.get("heatmap") or [])],
+            }
+            with open(os.path.join(project_folder, "youtube_meta.json"), "w", encoding="utf-8") as _f:
+                _json.dump(meta, _f, ensure_ascii=False, indent=1)
+            print(f"YouTube: {len(meta['chapters'])} capitulo(s), heatmap com {len(meta['heatmap'])} ponto(s).")
+        except Exception as e_meta:
+            print(f"Aviso: nao foi possivel salvar capitulos/heatmap: {e_meta}")
     
     # Caminho final do vídeo
     output_filename = 'input' 
